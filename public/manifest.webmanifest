@@ -1,0 +1,11 @@
+{
+  "name": "Olkinyei Expeditions",
+  "short_name": "Olkinyei",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#20251e",
+  "theme_color": "#20251e",
+  "icons": [
+    { "src": "/logo.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

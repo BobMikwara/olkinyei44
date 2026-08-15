@@ -1,0 +1,29 @@
+-- ============================================================================
+-- SUPERSEDED — do not run this file's historical contents.
+--
+-- Role names, triggers, and RLS from earlier versions of this file used
+-- legacy values ('root', 'booking_manager', 'marketing_manager'). All of that
+-- is consolidated in:
+--
+--     supabase/auth_schema_sync.sql
+--
+-- Run auth_schema_sync.sql AFTER schema.sql. It is idempotent and migrates
+-- legacy role values in place. Nothing in this file will apply the old
+-- policies again; the statements below are intentionally inert comments.
+--
+-- After the sync, provision the FIRST root account once:
+--
+--   insert into public.profiles (id, email, full_name, role, status, is_root)
+--   values (
+--     '<auth-user-uuid>',
+--     'root@example.com',
+--     'Root Super Admin',
+--     'root_super_admin',
+--     'active',
+--     true
+--   )
+--   on conflict (id) do update
+--     set role = 'root_super_admin', is_root = true, status = 'active';
+--
+-- ============================================================================
+select 'auth_schema_sync.sql supersedes production_auth.sql' as info;

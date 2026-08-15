@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.env
+.DS_Store
+.vscode/
+*.log
+*.local
+public/uploads/
+/*.zip
+/*.tar.gz
+/*.tgzall_objects.txt
+large_files.txt
+all_objects.txt
