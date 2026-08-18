@@ -34,18 +34,77 @@ create trigger cms_content_touch_trigger
   before update on public.cms_content
   for each row execute function public.cms_content_touch();
 
+-- These helpers are defined authoritatively by
+-- supabase/role_canonicalization.sql (and supabase/auth_schema_sync.sql).
+-- Define safe fallbacks here so this file can run on its own; the real
+-- definitions use "create or replace" and overwrite these without conflict.
+create or replace function public.is_root_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists(
+    select 1 from public.profiles
+    where id = auth.uid() and status = 'active'
+      and (is_root = true or role in ('root', 'root_super_admin'))
+  );
+$$;
+
+create or replace function public.is_staff()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists(
+    select 1 from public.profiles
+    where id = auth.uid() and status = 'active'
+      and (
+        is_root = true
+        or role in (
+          'root', 'root_super_admin', 'super_admin',
+          'content_manager', 'editor',
+          'booking_manager', 'reservation_manager', 'reservation', 'bookings',
+          'marketing_manager', 'marketing',
+          'finance'
+        )
+      )
+  );
+$$;
+
 alter table public.cms_content enable row level security;
 
 drop policy if exists "Public can read cms content" on public.cms_content;
+drop policy if exists "Staff can insert cms content" on public.cms_content;
+drop policy if exists "Staff can update cms content" on public.cms_content;
+drop policy if exists "Staff can delete cms content" on public.cms_content;
+-- Legacy single policy name, removed in favour of the per-command policies.
 drop policy if exists "Staff can write cms content" on public.cms_content;
 
+-- Anyone (including anonymous visitors) may read website content.
 create policy "Public can read cms content" on public.cms_content
   for select using (true);
 
-create policy "Staff can write cms content" on public.cms_content
-  for all to authenticated
+-- Authenticated staff may write. The policies are split per command rather
+-- than using a single "for all" policy, which is the most portable form and
+-- validates inserts against WITH CHECK explicitly (a standalone "for all"
+-- policy with only USING has been reported to raise a syntax error on some
+-- Supabase/Postgres versions).
+create policy "Staff can insert cms content" on public.cms_content
+  for insert to authenticated
+  with check (public.is_staff() or public.is_root_admin());
+
+create policy "Staff can update cms content" on public.cms_content
+  for update to authenticated
   using (public.is_staff() or public.is_root_admin())
   with check (public.is_staff() or public.is_root_admin());
+
+create policy "Staff can delete cms content" on public.cms_content
+  for delete to authenticated
+  using (public.is_staff() or public.is_root_admin());
 
 -- Realtime: every open browser tab updates in-place.
 do $$

@@ -28,22 +28,35 @@ insert into public.cms_content (id, content) values
 on conflict (id) do nothing;
 
 -- 3. RLS: the public may read every document (these are website content), and
---    authenticated staff may write them. The policies are dropped and recreated
---    so they match the current canonical helper functions regardless of which
---    migration order was used historically. The write policy carries BOTH a
---    USING and WITH CHECK clause, otherwise an INSERT is not validated against
---    the staff predicate and the CMS save is rejected. RLS itself is never disabled.
+--    authenticated staff may write them. Policies are split per command rather
+--    than using a single "for all" policy — this is the most portable form and
+--    validates inserts against WITH CHECK explicitly (a standalone "for all"
+--    policy with only USING has been reported to raise a syntax error on some
+--    Supabase/Postgres versions). RLS itself is never disabled.
 alter table public.cms_content enable row level security;
 
 drop policy if exists "Public can read cms content" on public.cms_content;
+drop policy if exists "Staff can insert cms content" on public.cms_content;
+drop policy if exists "Staff can update cms content" on public.cms_content;
+drop policy if exists "Staff can delete cms content" on public.cms_content;
+-- Legacy single policy name, removed in favour of the per-command policies.
+drop policy if exists "Staff can write cms content" on public.cms_content;
+
 create policy "Public can read cms content" on public.cms_content
   for select using (true);
 
-drop policy if exists "Staff can write cms content" on public.cms_content;
-create policy "Staff can write cms content" on public.cms_content
-  for all to authenticated
+create policy "Staff can insert cms content" on public.cms_content
+  for insert to authenticated
+  with check (public.is_staff() or public.is_root_admin());
+
+create policy "Staff can update cms content" on public.cms_content
+  for update to authenticated
   using (public.is_staff() or public.is_root_admin())
   with check (public.is_staff() or public.is_root_admin());
+
+create policy "Staff can delete cms content" on public.cms_content
+  for delete to authenticated
+  using (public.is_staff() or public.is_root_admin());
 
 do $$
 begin
