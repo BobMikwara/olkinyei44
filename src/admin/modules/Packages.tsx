@@ -1,9 +1,32 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Plus, Edit3, Copy, Archive, Search, Package, Trash2, ChevronUp, ChevronDown } from "lucide-react";
+import { Plus, Edit3, Copy, Archive, Search, Package, Trash2, ChevronUp, ChevronDown, Upload } from "lucide-react";
 import { store, useStore } from "../store";
 import { Button, Card, Input, Textarea, Select, Badge, Modal, ConfirmDialog, PageHeader, EmptyState, Tabs } from "../ui";
+import { uploadToStorage } from "../../lib/supabase";
 import type { SafariPackage } from "../types";
+
+/**
+ * Uploads a selected image to Supabase Storage and returns its persistent
+ * public URL. The editor only ever persists Storage URLs (or externally hosted
+ * URLs pasted into the field) — never a browser-local data: or blob: URL.
+ */
+async function uploadPackageImage(file: File, folder = "packages"): Promise<string | null> {
+  if (!file.type.startsWith("image/")) {
+    store.notify({ type: "error", title: "Choose an image file" });
+    return null;
+  }
+  if (file.size > 6_000_000) {
+    store.notify({ type: "error", title: "Image is too large", message: "Use a JPG, PNG or WebP under 6 MB." });
+    return null;
+  }
+  const result = await uploadToStorage(file, { folder, fileName: file.name, contentType: file.type });
+  if (!result.ok) {
+    store.notify({ type: "error", title: "Upload failed", message: result.message });
+    return null;
+  }
+  return result.url;
+}
 
 function PackageCard({ pkg, onEdit, onDuplicate, onDelete, onTogglePublish }: {
   pkg: SafariPackage;
@@ -131,30 +154,71 @@ function PackageEditor({ pkg, onClose }: { pkg: SafariPackage | null; onClose: (
 
   const update = <K extends keyof SafariPackage>(key: K, value: SafariPackage[K]) => setForm((current) => ({ ...current, [key]: value }));
 
-  const save = () => {
+  const heroInputRef = useRef<HTMLInputElement>(null);
+  const [uploadingHero, setUploadingHero] = useState(false);
+  const onHeroFile = async (file: File | undefined) => {
+    if (!file) return;
+    setUploadingHero(true);
+    try {
+      const url = await uploadPackageImage(file, "packages/hero");
+      if (url) update("image", url);
+    } finally {
+      setUploadingHero(false);
+    }
+  };
+
+  const galleryInputRef = useRef<HTMLInputElement>(null);
+  const [uploadingGallery, setUploadingGallery] = useState(false);
+  const onGalleryFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setUploadingGallery(true);
+    try {
+      const urls: string[] = [];
+      for (const file of Array.from(files)) {
+        const url = await uploadPackageImage(file, "packages/gallery");
+        if (url) urls.push(url);
+      }
+      if (urls.length > 0) update("gallery", [...(form.gallery ?? []), ...urls]);
+    } finally {
+      setUploadingGallery(false);
+      if (galleryInputRef.current) galleryInputRef.current.value = "";
+    }
+  };
+
+  const [saving, setSaving] = useState(false);
+  const save = async () => {
     if (!form.title || !form.region) {
       store.notify({ type: "error", title: "Missing required fields", message: "Title and region are required." });
       return;
     }
-    // Drop empty / whitespace-only list items so the database never stores
-    // blank Included or Not Included entries.
-    const sanitized = {
-      ...form,
-      included: (form.included ?? []).map((item) => item.trim()).filter((item) => item.length > 0),
-      excluded: (form.excluded ?? []).map((item) => item.trim()).filter((item) => item.length > 0),
-    };
-    if (pkg) {
-      store.actions.updatePackage(pkg.id, sanitized);
-    } else {
-      store.actions.createPackage(sanitized as Omit<SafariPackage, "id" | "createdAt" | "updatedAt" | "slug">);
+    setSaving(true);
+    try {
+      // Drop empty / whitespace-only list items so the database never stores
+      // blank Included or Not Included entries.
+      const sanitized = {
+        ...form,
+        included: (form.included ?? []).map((item) => item.trim()).filter((item) => item.length > 0),
+        excluded: (form.excluded ?? []).map((item) => item.trim()).filter((item) => item.length > 0),
+      };
+      let ok: boolean;
+      if (pkg) {
+        ok = await store.actions.updatePackage(pkg.id, sanitized);
+      } else {
+        const created = await store.actions.createPackage(sanitized as Omit<SafariPackage, "id" | "createdAt" | "updatedAt" | "slug">);
+        ok = created !== null;
+      }
+      // Only dismiss the editor once the Supabase write succeeded; on failure
+      // the action rolls the UI back and shows the actual error.
+      if (ok) onClose();
+    } finally {
+      setSaving(false);
     }
-    onClose();
   };
 
   return (
     <Modal open onClose={onClose} size="xl" title={pkg ? `Edit ${pkg.title}` : "New Safari Package"} footer={<>
       <Button variant="ghost" onClick={onClose}>Cancel</Button>
-      <Button onClick={save} icon={pkg ? undefined : Plus}>{pkg ? "Save changes" : "Create package"}</Button>
+      <Button onClick={() => { void save(); }} loading={saving} icon={pkg ? undefined : Plus}>{pkg ? "Save changes" : "Create package"}</Button>
     </>}>
       <div className="space-y-6">
         <div className="grid gap-4 md:grid-cols-2">
@@ -168,7 +232,31 @@ function PackageEditor({ pkg, onClose }: { pkg: SafariPackage | null; onClose: (
           <label className="block"><span className="mb-2 block text-[11px] font-medium uppercase tracking-wider text-[var(--admin-fg-muted)]">Difficulty</span><Select value={form.difficulty} onChange={(e) => update("difficulty", e.target.value as SafariPackage["difficulty"])}><option>Gentle</option><option>Moderate</option><option>Active</option><option>Expedition</option></Select></label>
         </div>
 
-        <label className="block"><span className="mb-2 block text-[11px] font-medium uppercase tracking-wider text-[var(--admin-fg-muted)]">Hero Image URL</span><Input value={form.image} onChange={(e) => update("image", e.target.value)} placeholder="https://..." /></label>
+        <div>
+          <span className="mb-2 block text-[11px] font-medium uppercase tracking-wider text-[var(--admin-fg-muted)]">Hero Image URL</span>
+          <div className="flex gap-2">
+            <Input value={form.image} onChange={(e) => update("image", e.target.value)} placeholder="https://..." />
+            <input ref={heroInputRef} type="file" accept="image/*" className="hidden" onChange={(e) => { void onHeroFile(e.target.files?.[0]); e.target.value = ""; }} />
+            <Button type="button" variant="secondary" icon={Upload} loading={uploadingHero} onClick={() => heroInputRef.current?.click()}>Upload</Button>
+          </div>
+          {form.image && <img src={form.image} alt="" className="mt-2 h-28 w-full rounded-md object-cover" />}
+        </div>
+
+        <div>
+          <span className="mb-2 block text-[11px] font-medium uppercase tracking-wider text-[var(--admin-fg-muted)]">Gallery images</span>
+          <div className="flex flex-wrap gap-2">
+            {(form.gallery ?? []).map((src, index) => (
+              <div key={`${src}-${index}`} className="group relative h-20 w-28 overflow-hidden rounded-md border border-[var(--admin-border)]">
+                <img src={src} alt="" className="h-full w-full object-cover" />
+                <button type="button" onClick={() => update("gallery", (form.gallery ?? []).filter((_, i) => i !== index))} className="absolute right-1 top-1 rounded bg-black/60 p-0.5 text-white opacity-0 transition group-hover:opacity-100" aria-label="Remove image"><Trash2 size={12} /></button>
+              </div>
+            ))}
+            <input ref={galleryInputRef} type="file" accept="image/*" multiple className="hidden" onChange={(e) => { void onGalleryFiles(e.target.files); }} />
+            <button type="button" onClick={() => galleryInputRef.current?.click()} className="flex h-20 w-28 items-center justify-center rounded-md border border-dashed border-[var(--admin-border)] text-[11px] text-[var(--admin-fg-muted)] hover:border-[var(--admin-accent)]">
+              {uploadingGallery ? "Uploading…" : "+ Add images"}
+            </button>
+          </div>
+        </div>
 
         <label className="block"><span className="mb-2 block text-[11px] font-medium uppercase tracking-wider text-[var(--admin-fg-muted)]">Summary</span><Textarea rows={3} value={form.summary} onChange={(e) => update("summary", e.target.value)} placeholder="Brief description for cards and listings..." /></label>
 

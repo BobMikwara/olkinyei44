@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Upload, Search, Image as ImageIcon, Film, FileText, Trash2, Edit3 } from "lucide-react";
 import { store, useStore } from "../store";
 import { Button, Input, Modal, PageHeader, Tabs, EmptyState } from "../ui";
+import { uploadToStorage } from "../../lib/supabase";
 import type { MediaAsset } from "../types";
 
 function MediaCard({ asset, onSelect, onEdit, onDelete, selected }: {
@@ -83,16 +84,35 @@ export default function MediaManager() {
     return true;
   });
 
-  const handleUpload = (files: FileList | null) => {
-    if (!files) return;
-    Array.from(files).forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const url = String(reader.result);
-        const type: MediaAsset["type"] = file.type.startsWith("image/") ? "image" : file.type.startsWith("video/") ? "video" : "pdf";
+  const [uploading, setUploading] = useState(false);
+
+  const handleUpload = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setUploading(true);
+    try {
+      for (const file of Array.from(files)) {
+        const type: MediaAsset["type"] = file.type.startsWith("image/")
+          ? "image"
+          : file.type.startsWith("video/")
+            ? "video"
+            : "pdf";
+        // Upload to Supabase Storage first. The returned public URL is what
+        // gets persisted — never a base64 data URL or blob: URL, because those
+        // only exist in the current browser and cannot load on other devices.
+        const result = await uploadToStorage(file, {
+          folder: type === "video" ? "library/videos" : type === "pdf" ? "library/documents" : "library/images",
+          fileName: file.name,
+          contentType: file.type || undefined,
+        });
+        if (!result.ok) {
+          store.notify({ type: "error", title: `Upload failed: ${file.name}`, message: result.message });
+          continue;
+        }
         store.actions.createMedia({
-          url,
-          thumbnail: type === "image" ? url : url,
+          url: result.url,
+          // Storage thumbnails for images use the same public object; videos
+          // and documents keep the full URL and the card shows a type icon.
+          thumbnail: result.url,
           type,
           name: file.name,
           alt: file.name.replace(/\.[^.]+$/, "").replace(/[-_]/g, " "),
@@ -103,16 +123,17 @@ export default function MediaManager() {
           uploadedBy: store.currentUser()?.id ?? "u1",
           folder: "Uploads",
         });
-      };
-      reader.readAsDataURL(file);
-    });
+      }
+    } finally {
+      setUploading(false);
+    }
   };
 
   return (
     <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
-      <PageHeader eyebrow="Content" title="Media Library" description="Upload, organize, and manage all visual assets for the website." actions={<>
-        <input ref={fileInputRef} type="file" multiple accept="image/*,video/*,.pdf" className="hidden" onChange={(e) => handleUpload(e.target.files)} />
-        <Button icon={Upload} onClick={() => fileInputRef.current?.click()}>Upload</Button>
+      <PageHeader eyebrow="Content" title="Media Library" description="Upload, organize, and manage all visual assets for the website. Files are stored in Supabase Storage so they load on every device." actions={<>
+        <input ref={fileInputRef} type="file" multiple accept="image/*,video/*,.pdf" className="hidden" onChange={(e) => { void handleUpload(e.target.files); e.target.value = ""; }} />
+        <Button icon={Upload} loading={uploading} onClick={() => fileInputRef.current?.click()}>{uploading ? "Uploading…" : "Upload"}</Button>
       </>} />
 
       <div className="mb-6 flex flex-wrap items-center gap-3">

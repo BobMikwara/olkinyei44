@@ -6,8 +6,14 @@
 -- The public website reads them; staff write via the CMS. Publish changes
 -- instantly reach every open tab through Realtime.
 
+-- Note: additional document ids (destinations, guides, vehicles, customers,
+-- media) are added by supabase/cms_content_persistence.sql, which also installs
+-- the canonical RLS policies. Run it after this file on existing databases.
 create table if not exists public.cms_content (
-  id text primary key check (id in ('site_settings', 'pages')),
+  id text primary key check (id in (
+    'site_settings', 'pages',
+    'destinations', 'guides', 'vehicles', 'customers', 'media'
+  )),
   content jsonb not null,
   updated_at timestamptz not null default now()
 );
@@ -38,7 +44,8 @@ create policy "Public can read cms content" on public.cms_content
 
 create policy "Staff can write cms content" on public.cms_content
   for all to authenticated
-  using (public.is_staff() or public.is_root_admin());
+  using (public.is_staff() or public.is_root_admin())
+  with check (public.is_staff() or public.is_root_admin());
 
 -- Realtime: every open browser tab updates in-place.
 do $$
