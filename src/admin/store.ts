@@ -840,7 +840,31 @@ if (typeof window !== "undefined" && supabase) {
     .on("postgres_changes", { event: "DELETE", schema: "public", table: "packages" }, (payload) => {
       applyPackageRealtime("DELETE", payload.old);
     })
-    .subscribe();
+    .subscribe((status, err) => {
+      // Report subscription state so a misconfigured realtime publication
+      // or a transient disconnect is diagnosable instead of silently
+      // failing to sync. On (re)connect, re-fetch every collection so a
+      // browser that was offline catches up with changes it missed.
+      if (import.meta.env.DEV) {
+        if (status === "SUBSCRIBED") console.debug("[Olkinyei] Realtime connected");
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED" || err) {
+          console.error("[Olkinyei] Realtime subscription status:", status, err);
+        }
+      }
+      if (status === "SUBSCRIBED") {
+        // Reset the one-shot bootstrap guards and pull the latest rows.
+        cmsContentBootstrapped = false;
+        blogBootstrapped = false;
+        testimonialsBootstrapped = false;
+        packagesBootstrapped = false;
+        CMS_COLLECTION_IDS.forEach((id) => { collectionBootstrapped[id] = false; });
+        void loadCloudCmsContent();
+        void loadCloudBlogPosts();
+        void loadCloudTestimonials();
+        void loadCloudPackages();
+        void loadAllCloudCollections();
+      }
+    });
 
   // Boot the content. Public bundle shares this module, so visitors get
   // fresh brand settings on first paint as well.
