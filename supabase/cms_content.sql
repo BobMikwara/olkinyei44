@@ -1,13 +1,14 @@
--- CMS content persistence: brand + page content live in the cloud so every
--- device sees the same public site. This joins bookings/auth on Supabase.
---
--- Two documents are stored: 'site_settings' (brand identity, colors,
--- contact, analytics) and 'pages' (each route's hero content + SEO).
--- The public website reads them; staff write via the CMS. Publish changes
--- instantly reach every open tab through Realtime.
+-- CMS content persistence: brand + page content + generic CMS collections
+-- (destinations, guides, vehicles, customers, media) live in the cloud so
+-- every device sees the same public site. The public website reads these
+-- rows; staff write via the CMS. Publish changes instantly reach every open
+-- tab through Realtime.
 
 create table if not exists public.cms_content (
-  id text primary key check (id in ('site_settings', 'pages')),
+  id text primary key check (id in (
+    'site_settings', 'pages',
+    'destinations', 'guides', 'vehicles', 'customers', 'media'
+  )),
   content jsonb not null,
   updated_at timestamptz not null default now()
 );
@@ -30,29 +31,47 @@ create trigger cms_content_touch_trigger
 
 alter table public.cms_content enable row level security;
 
+-- Public read of all published documents.
 drop policy if exists "Public can read cms content" on public.cms_content;
-drop policy if exists "Staff can write cms content" on public.cms_content;
-
-create policy "Public can read cms content" on public.cms_content
+create policy "Public can read cms content"
+  on public.cms_content
   for select using (true);
 
-create policy "Staff can write cms content" on public.cms_content
-  for all to authenticated
+-- Staff write, with explicit WITH CHECK for INSERT/UPDATE.
+drop policy if exists "Staff can insert cms content" on public.cms_content;
+create policy "Staff can insert cms content"
+  on public.cms_content for insert to authenticated
+  with check (public.is_staff() or public.is_root_admin());
+
+drop policy if exists "Staff can update cms content" on public.cms_content;
+create policy "Staff can update cms content"
+  on public.cms_content for update to authenticated
+  using (public.is_staff() or public.is_root_admin())
+  with check (public.is_staff() or public.is_root_admin());
+
+drop policy if exists "Staff can delete cms content" on public.cms_content;
+create policy "Staff can delete cms content"
+  on public.cms_content for delete to authenticated
   using (public.is_staff() or public.is_root_admin());
 
--- Realtime: every open browser tab updates in-place.
+-- Realtime: every open browser updates in-place.
 do $$
 begin
-  if not exists (
-    select 1 from pg_publication_tables
-    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'cms_content'
-  ) then
+  alter publication supabase_realtime add table public.cms_content;
+exception
+  when duplicate_object then null;
+  when undefined_object then
+    execute 'create publication supabase_realtime';
     alter publication supabase_realtime add table public.cms_content;
-  end if;
 end $$;
 
--- Seed the defaults so the first sync has content.
+-- Seed empty defaults so the first sync has content; existing rows kept.
 insert into public.cms_content (id, content) values
   ('site_settings', '{}'::jsonb),
-  ('pages', '[]'::jsonb)
+  ('pages',         '[]'::jsonb),
+  ('destinations',  '[]'::jsonb),
+  ('guides',        '[]'::jsonb),
+  ('vehicles',      '[]'::jsonb),
+  ('customers',     '[]'::jsonb),
+  ('media',         '[]'::jsonb)
 on conflict (id) do nothing;

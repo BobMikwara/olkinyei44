@@ -268,3 +268,51 @@ export async function deleteCloudBooking(reference: string): Promise<{ ok: boole
   if (error) return { ok: false, message: error.message };
   return { ok: true };
 }
+// ============ Supabase Storage (CMS media) =================================
+//
+// CMS uploads (logo, package images, blog heroes, media-library assets) are
+// stored in the public `expedition-media` bucket. The returned public URL is
+// what gets persisted to the database — never a browser-local data: or blob:
+// URL, because those only exist in the current browser and cannot load on any
+// other device.
+
+export const MEDIA_BUCKET = "expedition-media";
+
+export interface UploadResult {
+  ok: boolean;
+  url?: string;
+  path?: string;
+  message?: string;
+}
+
+/**
+ * Uploads a File/Blob to Supabase Storage and returns its persistent public
+ * URL. The caller is responsible for saving that URL to the database.
+ *
+ * - `folder` is the object prefix inside the bucket (e.g. "branding/logo").
+ * - The final object name is prefixed with a timestamp + random suffix to
+ *   avoid collisions when two users upload a file with the same name.
+ */
+export async function uploadToStorage(
+  file: File | Blob,
+  options: { folder?: string; fileName?: string; contentType?: string } = {},
+): Promise<UploadResult> {
+  if (!supabase) return { ok: false, message: "Supabase is not configured for this build." };
+  const folder = (options.folder ?? "misc").replace(/^\/+|\/+$/g, "");
+  const safeName = (options.fileName ?? "upload").replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 120) || "upload";
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const objectPath = folder ? `${folder}/${stamp}-${safeName}` : `${stamp}-${safeName}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from(MEDIA_BUCKET)
+    .upload(objectPath, file, {
+      contentType: options.contentType,
+      cacheControl: "3600",
+      upsert: false,
+    });
+  if (uploadError) return { ok: false, message: uploadError.message };
+
+  const { data } = supabase.storage.from(MEDIA_BUCKET).getPublicUrl(objectPath);
+  if (!data?.publicUrl) return { ok: false, message: "Could not obtain a public URL for the uploaded file." };
+  return { ok: true, url: data.publicUrl, path: objectPath };
+}
