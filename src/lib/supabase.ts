@@ -97,6 +97,88 @@ function buildClient(): SupabaseClient | null {
 export const supabase = buildClient();
 export const hasCloudBackend = Boolean(supabase);
 
+// ============ Media Storage (Supabase Storage) ==============================
+//
+// The single public bucket used for every CMS-uploaded image: the site logo,
+// safari package hero/gallery images, blog hero images, and the media library.
+// RLS on storage.objects permits authenticated staff to write and everyone to
+// read (see supabase/schema.sql and supabase/cms_content_persistence.sql).
+export const MEDIA_BUCKET = "expedition-media";
+
+export type UploadResult =
+  | { ok: true; path: string; url: string }
+  | { ok: false; message: string };
+
+/**
+ * Uploads a File/Blob to Supabase Storage and returns a persistent public URL.
+ *
+ * This is the ONLY supported way to turn a browser-selected file into a CMS
+ * image value. `URL.createObjectURL()` / `FileReader.readAsDataURL()` produce
+ * browser-local values (blob: or data:) that cannot be retrieved from any
+ * other device and must never be saved as the permanent record.
+ *
+ * The path is namespaced by folder so the media library stays browsable and
+ * overwrites never collide (a short uuid suffix is appended).
+ */
+export async function uploadToStorage(
+  file: File | Blob,
+  options: { folder?: string; fileName?: string; contentType?: string } = {},
+): Promise<UploadResult> {
+  if (!supabase) {
+    return { ok: false, message: "Cloud storage is not configured. Connect Supabase to upload files." };
+  }
+  const folder = (options.folder ?? "uploads").replace(/^\/+|\/+$/g, "");
+  const safeName = (options.fileName ?? (file instanceof File ? file.name : "upload"))
+    .toLowerCase()
+    .replace(/[^a-z0-9.\-_]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "upload";
+  const dot = safeName.lastIndexOf(".");
+  const stem = dot > 0 ? safeName.slice(0, dot) : safeName;
+  const ext = dot > 0 ? safeName.slice(dot) : "";
+  const suffix =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID().slice(0, 8)
+      : Math.random().toString(36).slice(2, 10);
+  const path = `${folder}/${Date.now()}-${suffix}-${stem}${ext}`;
+
+  try {
+    const { error } = await supabase.storage
+      .from(MEDIA_BUCKET)
+      .upload(path, file, {
+        contentType: options.contentType ?? (file instanceof File ? file.type || undefined : undefined),
+        cacheControl: "3600",
+        upsert: false,
+      });
+    if (error) {
+      if (import.meta.env.DEV) console.error("[Olkinyei] storage upload failed:", error.message);
+      return { ok: false, message: error.message };
+    }
+    const { data } = supabase.storage.from(MEDIA_BUCKET).getPublicUrl(path);
+    const url = data?.publicUrl ?? "";
+    if (!url) return { ok: false, message: "Upload succeeded but no public URL was returned." };
+    return { ok: true, path, url };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Storage upload failed";
+    if (import.meta.env.DEV) console.error("[Olkinyei] storage upload failed:", message);
+    return { ok: false, message };
+  }
+}
+
+/** Removes a previously uploaded object by its Storage path. Never throws. */
+export async function removeFromStorage(path: string | undefined | null): Promise<void> {
+  if (!supabase || !path) return;
+  // Only delete values that look like a Storage path — never an arbitrary
+  // external URL or the built-in /logo.svg.
+  const cleaned = path.startsWith(`${MEDIA_BUCKET}/`) ? path.slice(MEDIA_BUCKET.length + 1) : path;
+  if (/^(https?:)?\/\//.test(cleaned) || cleaned.startsWith("/")) return;
+  try {
+    await supabase.storage.from(MEDIA_BUCKET).remove([cleaned]);
+  } catch {
+    /* best-effort cleanup; the database record is the source of truth */
+  }
+}
+
 // Accurate, deploy-actionable reason string when cloud auth is unavailable.
 export function cloudUnavailableReason(): string {
   if (hasCloudBackend) return "";

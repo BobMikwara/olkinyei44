@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { Plus, MessageSquare, FileText, Search, Trash2 } from "lucide-react";
+import { Plus, MessageSquare, FileText, Search, Trash2, Upload } from "lucide-react";
 import { store, useStore } from "../store";
 import { Button, Card, Input, Textarea, Select, Badge, Modal, ConfirmDialog, PageHeader, EmptyState, Tabs, Avatar } from "../ui";
+import { uploadToStorage } from "../../lib/supabase";
 import type { BlogPost } from "../types";
 
 const STATUS_COLORS: Record<BlogPost["status"], "success" | "warning" | "neutral" | "info"> = {
@@ -32,33 +33,69 @@ function BlogEditor({ post, onClose }: { post: BlogPost | null; onClose: () => v
 
   const update = <K extends keyof BlogPost>(key: K, value: BlogPost[K]) => setForm((current) => ({ ...current, [key]: value }));
 
-  const save = (status: BlogPost["status"]) => {
+  const heroInputRef = useRef<HTMLInputElement>(null);
+  const [uploadingHero, setUploadingHero] = useState(false);
+  const onHeroFile = async (file: File | undefined) => {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      store.notify({ type: "error", title: "Choose an image file" });
+      return;
+    }
+    if (file.size > 6_000_000) {
+      store.notify({ type: "error", title: "Image is too large", message: "Use a JPG, PNG or WebP under 6 MB." });
+      return;
+    }
+    setUploadingHero(true);
+    try {
+      const result = await uploadToStorage(file, { folder: "blog", fileName: file.name, contentType: file.type });
+      if (!result.ok) {
+        store.notify({ type: "error", title: "Upload failed", message: result.message });
+        return;
+      }
+      update("heroImage", result.url);
+    } finally {
+      setUploadingHero(false);
+      if (heroInputRef.current) heroInputRef.current.value = "";
+    }
+  };
+
+  const [saving, setSaving] = useState(false);
+  const save = async (status: BlogPost["status"]) => {
     if (!form.title) {
       store.notify({ type: "error", title: "Title required" });
       return;
     }
-    const slug = form.slug || form.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-    const readingTime = Math.max(1, Math.ceil((form.body?.split(/\s+/).length ?? 0) / 200));
-    // Draft explicitly clears the publish timestamp so the row disappears
-    // from the public site (RLS only serves published rows).
-    const data = { ...form, slug, readingTime, status, publishedAt: status === "published" ? (form.publishedAt ?? new Date().toISOString()) : undefined };
+    setSaving(true);
+    try {
+      const slug = form.slug || form.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      const readingTime = Math.max(1, Math.ceil((form.body?.split(/\s+/).length ?? 0) / 200));
+      // Draft explicitly clears the publish timestamp so the row disappears
+      // from the public site (RLS only serves published rows).
+      const data = { ...form, slug, readingTime, status, publishedAt: status === "published" ? (form.publishedAt ?? new Date().toISOString()) : undefined };
 
-    if (post) {
-      store.actions.updateBlogPost(post.id, data);
-    } else {
-      store.actions.createBlogPost(data as Omit<BlogPost, "id" | "createdAt" | "updatedAt">);
+      let ok: boolean;
+      if (post) {
+        ok = await store.actions.updateBlogPost(post.id, data);
+      } else {
+        const created = await store.actions.createBlogPost(data as Omit<BlogPost, "id" | "createdAt" | "updatedAt">);
+        ok = created !== null;
+      }
+      // Only close when the Supabase write was verified; otherwise the action
+      // rolls back and surfaces the actual error, preserving the draft.
+      if (ok) onClose();
+    } finally {
+      setSaving(false);
     }
-    onClose();
   };
 
   return (
     <Modal open onClose={onClose} size="xl" title={post ? "Edit Article" : "New Article"} footer={<>
-      <Button variant="ghost" onClick={onClose}>Cancel</Button>
+      <Button variant="ghost" onClick={onClose} disabled={saving}>Cancel</Button>
       {post && post.status === "published" && (
-        <Button variant="outline" onClick={() => save("draft")}>Unpublish</Button>
+        <Button variant="outline" onClick={() => { void save("draft"); }} loading={saving}>Unpublish</Button>
       )}
-      <Button variant="outline" onClick={() => save("draft")}>{post && post.status !== "published" ? "Save Draft" : "Save as Draft"}</Button>
-      <Button onClick={() => save("published")}>{post && post.status === "published" ? "Update" : "Publish"}</Button>
+      <Button variant="outline" onClick={() => { void save("draft"); }} loading={saving}>{post && post.status !== "published" ? "Save Draft" : "Save as Draft"}</Button>
+      <Button onClick={() => { void save("published"); }} loading={saving}>{post && post.status === "published" ? "Update" : "Publish"}</Button>
     </>}>
       <div className="space-y-5">
         <label className="block"><span className="mb-2 block text-[11px] font-medium uppercase tracking-wider text-[var(--admin-fg-muted)]">Title *</span><Input value={form.title} onChange={(e) => update("title", e.target.value)} placeholder="Reading the River: A Guide to the Great Migration" /></label>
@@ -73,7 +110,15 @@ function BlogEditor({ post, onClose }: { post: BlogPost | null; onClose: () => v
           <label className="block"><span className="mb-2 block text-[11px] font-medium uppercase tracking-wider text-[var(--admin-fg-muted)]">Tags (comma-separated)</span><Input value={form.tags?.join(", ")} onChange={(e) => update("tags", e.target.value.split(",").map((t) => t.trim()).filter(Boolean))} /></label>
         </div>
 
-        <label className="block"><span className="mb-2 block text-[11px] font-medium uppercase tracking-wider text-[var(--admin-fg-muted)]">Hero Image URL</span><Input value={form.heroImage} onChange={(e) => update("heroImage", e.target.value)} /></label>
+        <div>
+          <span className="mb-2 block text-[11px] font-medium uppercase tracking-wider text-[var(--admin-fg-muted)]">Hero Image URL</span>
+          <div className="flex gap-2">
+            <Input value={form.heroImage} onChange={(e) => update("heroImage", e.target.value)} placeholder="https://..." />
+            <input ref={heroInputRef} type="file" accept="image/*" className="hidden" onChange={(e) => { void onHeroFile(e.target.files?.[0]); }} />
+            <Button type="button" variant="secondary" icon={Upload} loading={uploadingHero} onClick={() => heroInputRef.current?.click()}>Upload</Button>
+          </div>
+          {form.heroImage && <img src={form.heroImage} alt="" className="mt-2 h-28 w-full rounded-md object-cover" />}
+        </div>
 
         <label className="flex items-center gap-2 text-[12.5px]"><input type="checkbox" className="accent-[var(--admin-accent)]" checked={form.featured} onChange={(e) => update("featured", e.target.checked)} />Featured article</label>
 

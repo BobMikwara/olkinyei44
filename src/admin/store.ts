@@ -9,7 +9,7 @@ import type {
   PageSettings, PermissionSet, Role, SafariPackage, Session,
   SiteSettings, Testimonial, TestimonialStatus, Theme, Vehicle,
 } from "./types";
-import { cloudUnavailableReason, supabase } from "../lib/supabase";
+import { cloudUnavailableReason, supabase, uploadToStorage } from "../lib/supabase";
 import { LEGACY_ROLE_ALIASES, TABLES } from "./constants";
 import {
   authChangePassword,
@@ -192,46 +192,46 @@ type StoreState = {
   notifications: Notification[];
 };
 
+// UI-only localStorage. We deliberately do NOT persist CMS content here:
+// Supabase is the single source of truth for packages, settings, pages, etc.
+// Persisting those collections to localStorage was the root cause of changes
+// appearing in one browser but never reaching another device. Only harmless
+// UI preferences (theme) and the unread badge are kept across reloads.
 const STORAGE_KEY = "olkinyei-admin-v2";
 // The public booking form writes submissions here (same-browser bridge) and
 // to Supabase when configured (cross-device bridge).
 const PUBLIC_BOOKINGS_KEY = "olkinyei-bookings";
 
-function loadState(): StoreState {
+type UiPreferences = Pick<StoreState, "theme" | "newBookingsCount">;
+
+function loadUiPreferences(): UiPreferences {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const saved = JSON.parse(raw) as Partial<StoreState>;
+      const saved = JSON.parse(raw) as Partial<UiPreferences>;
       return {
         theme: saved.theme ?? "dark",
-        currentUserId: saved.currentUserId ?? null,
-        session: saved.session ?? null,
-        users: saved.users ?? seedUsers,
-        bookings: saved.bookings ?? seedBookings,
         newBookingsCount: saved.newBookingsCount ?? 0,
-        packages: saved.packages ?? seedPackages,
-        destinations: saved.destinations ?? seedDestinations,
-        media: saved.media ?? seedMedia,
-        blogPosts: saved.blogPosts ?? seedBlogPosts,
-        testimonials: saved.testimonials ?? [],
-        guides: saved.guides ?? seedGuides,
-        vehicles: saved.vehicles ?? seedVehicles,
-        customers: saved.customers ?? seedCustomers,
-        pages: saved.pages ?? seedPages,
-        siteSettings: { ...seedSiteSettings, ...(saved.siteSettings ?? {}) },
-        activity: saved.activity ?? seedActivity,
-        audit: saved.audit ?? [],
-        notifications: [],
       };
     }
   } catch { /* fall through to defaults */ }
+  return { theme: "dark", newBookingsCount: 0 };
+}
+
+function loadState(): StoreState {
+  // NOTE: collections start from their seed defaults and are replaced by the
+  // authoritative Supabase rows during bootstrap (loadCloudPackages,
+  // loadCloudCmsContent, loadCloudBlogPosts, loadCloudTestimonials, etc.).
+  // Browser storage must never seed CMS content, or a stale local copy could
+  // mask or override the database values.
+  const prefs = loadUiPreferences();
   return {
-    theme: "dark",
+    theme: prefs.theme,
     currentUserId: null,
     session: null,
     users: seedUsers,
     bookings: seedBookings,
-    newBookingsCount: 0,
+    newBookingsCount: prefs.newBookingsCount,
     packages: seedPackages,
     destinations: seedDestinations,
     media: seedMedia,
@@ -386,9 +386,21 @@ function subscribeToBookingsAuthenticated(onRow: (booking: import("../data").Boo
 
 window.addEventListener("storage", (event) => {
   if (event.key === STORAGE_KEY && event.newValue) {
+    // Only UI preferences are shared across tabs (theme, unread badge). The
+    // actual CMS state always comes from Supabase, so we must never replace
+    // it with a serialised snapshot from another tab.
     try {
-      state = JSON.parse(event.newValue) as StoreState;
-      listeners.forEach((listener) => listener());
+      const incoming = JSON.parse(event.newValue) as Partial<UiPreferences>;
+      let changed = false;
+      if (incoming.theme && incoming.theme !== state.theme) {
+        state = { ...state, theme: incoming.theme };
+        changed = true;
+      }
+      if (typeof incoming.newBookingsCount === "number" && incoming.newBookingsCount !== state.newBookingsCount) {
+        state = { ...state, newBookingsCount: incoming.newBookingsCount };
+        changed = true;
+      }
+      if (changed) listeners.forEach((listener) => listener());
     } catch { /* Ignore invalid external state. */ }
     return;
   }
@@ -400,7 +412,16 @@ window.addEventListener("storage", (event) => {
 });
 
 function persist() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
+  // Persist UI preferences ONLY. Never write CMS content to localStorage —
+  // Supabase is the single source of truth and a local snapshot would let a
+  // stale browser override the live database on the next load.
+  try {
+    const prefs: UiPreferences = {
+      theme: state.theme,
+      newBookingsCount: state.newBookingsCount,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+  }
   catch { /* ignore quota errors */ }
 }
 
@@ -419,12 +440,15 @@ function applyCloudSiteSettings(content: unknown) {
   if (!content || typeof content !== "object" || Array.isArray(content)) return;
   const incoming = content as Partial<SiteSettings>;
   if (Object.keys(incoming).length === 0) return;
-  state = { ...state, siteSettings: { ...state.siteSettings, ...incoming } };
+  // Cloud is authoritative: start from the seed defaults for any key the
+  // database has not explicitly set, then overlay the saved values.
+  state = { ...state, siteSettings: { ...seedSiteSettings, ...state.siteSettings, ...incoming } };
   emit();
 }
 
 function applyCloudPages(content: unknown) {
-  if (!Array.isArray(content) || content.length === 0) return;
+  if (!Array.isArray(content)) return;
+  if (content.length === 0) return; // keep seed pages until the CMS publishes one
   state = { ...state, pages: content as PageSettings[] };
   emit();
 }
@@ -433,33 +457,190 @@ async function loadCloudCmsContent(): Promise<void> {
   if (!supabase || cmsContentBootstrapped) return;
   cmsContentBootstrapped = true;
   try {
-    // First, maybe seed the cloud once from local defaults so the first user
-    // migration doesn't discard anything.
-    const { data } = await supabase.from(TABLES.cmsContent).select("id, content");
+    const { data, error } = await supabase.from(TABLES.cmsContent).select("id, content");
+    if (error) throw new Error(error.message);
     const rows = (data ?? []) as { id: string; content: unknown }[];
     for (const row of rows) {
       if (row.id === "site_settings") applyCloudSiteSettings(row.content);
       if (row.id === "pages") applyCloudPages(row.content);
     }
     if (import.meta.env.DEV) console.debug("[Olkinyei] CMS content synced from Supabase");
-  } catch {
+  } catch (error) {
     cmsContentBootstrapped = false; // allow retry on next focus/save
+    if (import.meta.env.DEV) console.warn("[Olkinyei] Could not load cms_content:", error);
   }
 }
 
+// Serialises writes so two rapid saves (e.g. toggling a setting then saving a
+// page) cannot race and clobber each other.
 let cloudSaveQueue: Promise<void> = Promise.resolve();
 
-async function cloudSaveDocument(id: "site_settings" | "pages", content: unknown): Promise<void> {
+/**
+ * Persists a CMS document (site settings / pages) to Supabase.
+ *
+ * The response is ALWAYS checked. A failure is returned to the caller (and
+ * surfaced to the CMS user) rather than swallowed — previously the upsert
+ * error was ignored, so the UI reported "Saved" even when the database write
+ * was rejected by RLS, which is exactly how local-only edits happened.
+ */
+async function cloudSaveDocument(
+  id: "site_settings" | "pages",
+  content: unknown,
+): Promise<{ ok: true } | { ok: false; message: string }> {
   const client = supabase;
-  if (!client) { cmsContentBootstrapped = false; return; }
-  cloudSaveQueue = cloudSaveQueue.then(async () => {
-    try {
-      await client.from(TABLES.cmsContent).upsert({ id, content, updated_at: new Date().toISOString() });
-    } catch (error) {
-      if (import.meta.env.DEV) console.warn("[Olkinyei] cloud save failed for", id, error);
+  if (!client) {
+    cmsContentBootstrapped = false;
+    return { ok: false, message: "Supabase is not configured for this build." };
+  }
+  try {
+    await new Promise<void>((resolve, reject) => {
+      cloudSaveQueue = cloudSaveQueue
+        .then(async () => {
+          const { error } = await client
+            .from(TABLES.cmsContent)
+            .upsert({ id, content, updated_at: new Date().toISOString() });
+          if (error) throw new Error(error.message);
+        })
+        .then(resolve, reject);
+    });
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Cloud save failed";
+    if (import.meta.env.DEV) console.error("[Olkinyei] cloud save failed for", id, message);
+    return { ok: false, message };
+  }
+}
+
+// ============ Generic CMS collections (Supabase cms_content) ================
+//
+// Collections that do not have their own dedicated relational table
+// (destinations, guides, vehicles, customers, media) are persisted as a single
+// JSON document inside `public.cms_content`, keyed by collection id. This
+// makes them global (every device/browser reads the same rows) without
+// requiring a schema migration per entity. The table's primary-key CHECK is
+// widened by supabase/cms_content_persistence.sql to permit these ids.
+//
+// As with every other write here, the Supabase response is checked and a
+// failure is surfaced to the CMS user; local React state is NEVER the
+// authoritative copy.
+
+type CmsCollectionId = "destinations" | "guides" | "vehicles" | "customers" | "media";
+
+const CMS_COLLECTION_IDS: CmsCollectionId[] = ["destinations", "guides", "vehicles", "customers", "media"];
+
+const collectionBootstrapped: Record<CmsCollectionId, boolean> = {
+  destinations: false,
+  guides: false,
+  vehicles: false,
+  customers: false,
+  media: false,
+};
+
+function applyCloudCollection(id: CmsCollectionId, content: unknown): void {
+  if (!Array.isArray(content)) return;
+  if (content.length === 0) return; // keep seed content until the CMS publishes the first record
+  switch (id) {
+    case "destinations":
+      state = { ...state, destinations: content as Destination[] };
+      break;
+    case "guides":
+      state = { ...state, guides: content as Guide[] };
+      break;
+    case "vehicles":
+      state = { ...state, vehicles: content as Vehicle[] };
+      break;
+    case "customers":
+      state = { ...state, customers: content as Customer[] };
+      break;
+    case "media":
+      state = { ...state, media: content as MediaAsset[] };
+      break;
+  }
+  emit();
+}
+
+function collectionFromState(id: CmsCollectionId): unknown[] {
+  switch (id) {
+    case "destinations": return state.destinations;
+    case "guides": return state.guides;
+    case "vehicles": return state.vehicles;
+    case "customers": return state.customers;
+    case "media": return state.media;
+  }
+}
+
+async function loadCloudCollection(id: CmsCollectionId): Promise<void> {
+  const client = supabase;
+  if (!client || collectionBootstrapped[id]) return;
+  collectionBootstrapped[id] = true;
+  try {
+    const { data, error } = await client
+      .from(TABLES.cmsContent)
+      .select("content")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) {
+      // The row (or the allowed id) may not exist until the first save / the
+      // persistence migration has run. That is not fatal — seed content shows
+      // until then. Re-enable bootstrap so the next save retries.
+      if (error.code === "PGRST106" || /check/i.test(error.message)) {
+        collectionBootstrapped[id] = false;
+        return;
+      }
+      throw new Error(error.message);
     }
-  });
-  return cloudSaveQueue;
+    if (data) applyCloudCollection(id, (data as { content: unknown }).content);
+    if (import.meta.env.DEV) console.debug(`[Olkinyei] ${id} synced from Supabase`);
+  } catch (error) {
+    collectionBootstrapped[id] = false;
+    if (import.meta.env.DEV) console.warn(`[Olkinyei] Could not load ${id}:`, error);
+  }
+}
+
+async function loadAllCloudCollections(): Promise<void> {
+  await Promise.all(CMS_COLLECTION_IDS.map(loadCloudCollection));
+}
+
+/**
+ * Persists one collection to `cms_content` and verifies the response. Returns
+ * a result the calling action can surface to the user.
+ */
+async function saveCloudCollection(
+  id: CmsCollectionId,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const client = supabase;
+  if (!client) return { ok: false, message: "Supabase is not configured for this build." };
+  const content = collectionFromState(id);
+  try {
+    const { error } = await client
+      .from(TABLES.cmsContent)
+      .upsert({ id, content, updated_at: new Date().toISOString() });
+    if (error) throw new Error(error.message);
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Cloud save failed";
+    if (import.meta.env.DEV) console.error(`[Olkinyei] ${id} cloud save failed:`, message);
+    return { ok: false, message };
+  }
+}
+
+/**
+ * Fire-and-forget wrapper used by the legacy synchronous actions. It writes
+ * the current collection state and reports any failure as a notification so
+ * the CMS user is never told "saved" when the database rejected it.
+ */
+function persistCollection(id: CmsCollectionId): void {
+  void (async () => {
+    const result = await saveCloudCollection(id);
+    if (!result.ok) {
+      notify({
+        type: "error",
+        title: "Not published to the website",
+        message: `Saved locally, but Supabase rejected it: ${result.message.slice(0, 140)}`,
+        duration: 9000,
+      });
+    }
+  })();
 }
 
 // ============ Blog post schema mapping (CMS ⇆ Supabase blog_posts) ============
@@ -609,8 +790,14 @@ if (typeof window !== "undefined" && supabase) {
     .channel("olkinyei-cms-content")
     .on("postgres_changes", { event: "*", schema: "public", table: "cms_content" }, (payload) => {
       const row = payload.new as { id?: string; content?: unknown };
-      if (row?.id === "site_settings") applyCloudSiteSettings(row.content);
-      if (row?.id === "pages") applyCloudPages(row.content);
+      if (!row?.id) return;
+      if (row.id === "site_settings") applyCloudSiteSettings(row.content);
+      if (row.id === "pages") applyCloudPages(row.content);
+      if (row.id === "destinations") applyCloudCollection("destinations", row.content);
+      if (row.id === "guides") applyCloudCollection("guides", row.content);
+      if (row.id === "vehicles") applyCloudCollection("vehicles", row.content);
+      if (row.id === "customers") applyCloudCollection("customers", row.content);
+      if (row.id === "media") applyCloudCollection("media", row.content);
     })
     .on("postgres_changes", { event: "INSERT", schema: "public", table: "blog_posts" }, (payload) => {
       applyBlogRealtimeRow("INSERT", payload.new);
@@ -647,6 +834,7 @@ if (typeof window !== "undefined" && supabase) {
   void loadCloudBlogPosts();
   void loadCloudTestimonials();
   void loadCloudPackages();
+  void loadAllCloudCollections();
 }
 
 export function newBlogId(): string {
@@ -816,47 +1004,48 @@ function applyPackageRealtime(action: "INSERT" | "UPDATE" | "DELETE", row: unkno
   emit();
 }
 
-/** Persists a package to the database. Errors surface, never swallowed. */
-function packageCloudSave(pkg: SafariPackage | null, deletedId?: string): void {
+/**
+ * Persists a package to the database. The Supabase response is always checked
+ * and a failure is returned (and surfaced) rather than swallowed, so the CMS
+ * never reports a successful save when the database rejected it.
+ */
+async function packageCloudSave(
+  pkg: SafariPackage | null,
+  deletedId?: string,
+): Promise<{ ok: true } | { ok: false; message: string }> {
   const client = supabase;
-  if (!client) return;
-  void (async () => {
-    try {
-      if (deletedId) {
-        if (!UUID_PATTERN.test(deletedId)) return;
-        const { error } = await client.from("packages").delete().eq("id", deletedId);
-        if (error) throw error;
-        return;
-      }
-      if (!pkg) return;
-      const row = packageToRow(pkg);
-      if (UUID_PATTERN.test(pkg.id)) {
-        const { error } = await client.from("packages").upsert(row, { onConflict: "id" });
-        if (error) throw error;
-        return;
-      }
-      // Seed ids ("p1") are not uuids: let Postgres mint one, keyed by slug.
-      const { id: _seedId, ...withoutId } = row;
-      const { data, error } = await client
-        .from("packages")
-        .upsert(withoutId, { onConflict: "slug" })
-        .select("id")
-        .single();
+  if (!client) return { ok: false, message: "Supabase is not configured for this build." };
+  try {
+    if (deletedId) {
+      if (!UUID_PATTERN.test(deletedId)) return { ok: true }; // never reached the cloud
+      const { error } = await client.from(TABLES.packages).delete().eq("id", deletedId);
       if (error) throw error;
-      const cloudId = (data as { id: string }).id;
-      state = { ...state, packages: state.packages.map((p) => (p.id === pkg.id ? { ...p, id: cloudId } : p)) };
-      emit();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (import.meta.env.DEV) console.error("[Olkinyei] package cloud write failed:", message);
-      notify({
-        type: "error",
-        title: "Not published to the website",
-        message: `Saved locally, but Supabase rejected it: ${message.slice(0, 140)}`,
-        duration: 9000,
-      });
+      return { ok: true };
     }
-  })();
+    if (!pkg) return { ok: false, message: "No package supplied." };
+    const row = packageToRow(pkg);
+    if (UUID_PATTERN.test(pkg.id)) {
+      const { error } = await client.from(TABLES.packages).upsert(row, { onConflict: "id" });
+      if (error) throw error;
+      return { ok: true };
+    }
+    // Seed ids ("p1") are not uuids: let Postgres mint one, keyed by slug.
+    const { id: _seedId, ...withoutId } = row;
+    const { data, error } = await client
+      .from(TABLES.packages)
+      .upsert(withoutId, { onConflict: "slug" })
+      .select("id")
+      .single();
+    if (error) throw error;
+    const cloudId = (data as { id: string }).id;
+    state = { ...state, packages: state.packages.map((p) => (p.id === pkg.id ? { ...p, id: cloudId } : p)) };
+    emit();
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (import.meta.env.DEV) console.error("[Olkinyei] package cloud write failed:", message);
+    return { ok: false, message };
+  }
 }
 
 // ============ Testimonials (public.testimonials) ============
@@ -960,52 +1149,50 @@ function applyTestimonialRealtime(action: "INSERT" | "UPDATE" | "DELETE", row: u
   emit();
 }
 
-// Writes keep Supabase as the source of truth. Failures are reported, never
-// swallowed, so a broken sync can't masquerade as a successful save.
-function blogCloudSave(post: BlogPost | null, deletedId?: string): void {
+// Writes keep Supabase as the source of truth. The response is checked and a
+// failure is returned (and surfaced) rather than swallowed, so a broken sync
+// can never masquerade as a successful save.
+async function blogCloudSave(
+  post: BlogPost | null,
+  deletedId?: string,
+): Promise<{ ok: true } | { ok: false; message: string }> {
   const client = supabase;
-  if (!client) return;
-  void (async () => {
-    try {
-      if (deletedId) {
-        // A non-uuid id never reached the cloud, so there is nothing to remove.
-        if (!UUID_PATTERN.test(deletedId)) return;
-        const { error } = await client.from(TABLES.blogPosts).delete().eq("id", deletedId);
-        if (error) throw error;
-        return;
-      }
-      if (!post) return;
-      const row = blogPostToRow(post);
-
-      if (UUID_PATTERN.test(post.id)) {
-        const { error } = await client.from(TABLES.blogPosts).upsert(row, { onConflict: "id" });
-        if (error) throw error;
-        return;
-      }
-
-      // Legacy/local id: let Postgres mint the uuid, then adopt it locally so
-      // subsequent edits and deletes address the same row.
-      const { id: _localId, ...withoutId } = row;
-      const { data, error } = await client
-        .from(TABLES.blogPosts)
-        .upsert(withoutId, { onConflict: "slug" })
-        .select("id")
-        .single();
+  if (!client) return { ok: false, message: "Supabase is not configured for this build." };
+  try {
+    if (deletedId) {
+      // A non-uuid id never reached the cloud, so there is nothing to remove.
+      if (!UUID_PATTERN.test(deletedId)) return { ok: true };
+      const { error } = await client.from(TABLES.blogPosts).delete().eq("id", deletedId);
       if (error) throw error;
-      const cloudId = (data as { id: string }).id;
-      state = { ...state, blogPosts: state.blogPosts.map((item) => (item.id === post.id ? { ...item, id: cloudId } : item)) };
-      emit();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (import.meta.env.DEV) console.error("[Olkinyei] blog cloud write failed:", message);
-      notify({
-        type: "error",
-        title: "Not published to the website",
-        message: `The article is saved locally but Supabase rejected it: ${message.slice(0, 140)}`,
-        duration: 9000,
-      });
+      return { ok: true };
     }
-  })();
+    if (!post) return { ok: false, message: "No article supplied." };
+    const row = blogPostToRow(post);
+
+    if (UUID_PATTERN.test(post.id)) {
+      const { error } = await client.from(TABLES.blogPosts).upsert(row, { onConflict: "id" });
+      if (error) throw error;
+      return { ok: true };
+    }
+
+    // Legacy/local id: let Postgres mint the uuid, then adopt it locally so
+    // subsequent edits and deletes address the same row.
+    const { id: _localId, ...withoutId } = row;
+    const { data, error } = await client
+      .from(TABLES.blogPosts)
+      .upsert(withoutId, { onConflict: "slug" })
+      .select("id")
+      .single();
+    if (error) throw error;
+    const cloudId = (data as { id: string }).id;
+    state = { ...state, blogPosts: state.blogPosts.map((item) => (item.id === post.id ? { ...item, id: cloudId } : item)) };
+    emit();
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (import.meta.env.DEV) console.error("[Olkinyei] blog cloud write failed:", message);
+    return { ok: false, message };
+  }
 }
 
 function subscribe(listener: () => void) {
@@ -1224,10 +1411,16 @@ const actions = {
     testimonialsBootstrapped = false;
     packagesBootstrapped = false;
     blogBootstrapped = false;
+    // Staff may see drafts/archived rows RLS hides from anonymous visitors, so
+    // every collection must be re-read once a session exists.
+    (Object.keys(collectionBootstrapped) as CmsCollectionId[]).forEach((id) => {
+      collectionBootstrapped[id] = false;
+    });
     await Promise.all([
       loadCloudTestimonials(),
       loadCloudPackages(),
       loadCloudBlogPosts(),
+      loadAllCloudCollections(),
     ]);
   },
 
@@ -1533,75 +1726,119 @@ const actions = {
   updateBooking(id: string, patch: Partial<Booking>) {
     const booking = state.bookings.find((b) => b.id === id);
     if (!booking) return;
+    const previous = state.bookings;
     state = { ...state, bookings: state.bookings.map((b) => b.id === id ? { ...b, ...patch } : b) };
     logActivity("updated", "Booking", id, `${booking.reference} · ${booking.name}`);
-    notify({ type: "success", title: "Booking updated", message: `${booking.reference} saved.` });
     // Mirror status changes to the shared database so every device and the
-    // public-side lookup stay consistent.
+    // public-side lookup stay consistent. The response is checked: a failure
+    // rolls the UI back and surfaces the actual error instead of pretending
+    // the change was saved.
     if (supabase && patch.status) {
+      const syncedStatus = patch.status;
       void (async () => {
         try {
-          await supabase.from(TABLES.bookings).update({ status: patch.status }).eq("reference", booking.reference);
+          const { error } = await supabase
+            .from(TABLES.bookings)
+            .update({ status: syncedStatus })
+            .eq("reference", booking.reference);
+          if (error) throw new Error(error.message);
           audit("booking.status.synced", "booking", "success", { targetId: booking.reference });
-        } catch {
-          notify({ type: "warning", title: "Cloud sync delayed", message: `${booking.reference} updated locally; it will sync on the next refresh.` });
-          audit("booking.status.synced", "booking", "failure", { targetId: booking.reference, reason: "network" });
+          notify({ type: "success", title: "Booking updated", message: `${booking.reference} saved.` });
+        } catch (error) {
+          state = { ...state, bookings: previous };
+          emit();
+          const message = error instanceof Error ? error.message : "Network error";
+          notify({ type: "error", title: "Booking could not be saved", message });
+          audit("booking.status.synced", "booking", "failure", { targetId: booking.reference, reason: message });
         }
       })();
+    } else {
+      notify({ type: "success", title: "Booking updated", message: `${booking.reference} saved.` });
     }
     emit();
   },
   deleteBooking(id: string) {
     const booking = state.bookings.find((b) => b.id === id);
     if (!booking) return;
+    const previous = state.bookings;
     state = { ...state, bookings: state.bookings.filter((b) => b.id !== id) };
     logActivity("deleted", "Booking", id, `${booking.reference} · ${booking.name}`);
     notify({ type: "info", title: "Booking archived", message: `${booking.reference} moved to archive.` });
     if (supabase) {
-      void supabase.from(TABLES.bookings).delete().eq("reference", booking.reference);
+      void (async () => {
+        const { error } = await supabase.from(TABLES.bookings).delete().eq("reference", booking.reference);
+        if (error) {
+          state = { ...state, bookings: previous };
+          emit();
+          notify({ type: "error", title: "Booking could not be archived", message: error.message });
+        }
+      })();
     }
     emit();
   },
 
   // Packages
-  createPackage(pkg: Omit<SafariPackage, "id" | "createdAt" | "updatedAt" | "slug">) {
+  async createPackage(pkg: Omit<SafariPackage, "id" | "createdAt" | "updatedAt" | "slug">): Promise<SafariPackage | null> {
     // packages.id is a Postgres uuid column.
     const id = newBlogId();
     const slug = pkg.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
     const entry: SafariPackage = { ...pkg, id, slug, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     state = { ...state, packages: [entry, ...state.packages] };
     logActivity("created", "Package", id, entry.title);
-    notify({ type: "success", title: "Package created", message: `${entry.title} is now in your library.` });
     emit();
-    packageCloudSave(entry);
+    const result = await packageCloudSave(entry);
+    if (!result.ok) {
+      // Roll back the optimistic insert so the UI never claims the package
+      // exists when the database rejected it.
+      state = { ...state, packages: state.packages.filter((p) => p.id !== id) };
+      emit();
+      notify({ type: "error", title: "Package not created", message: result.message.slice(0, 160) });
+      return null;
+    }
+    notify({ type: "success", title: "Package created", message: `${entry.title} is now in your library and visible on the website.` });
     return entry;
   },
-  updatePackage(id: string, patch: Partial<SafariPackage>) {
+  async updatePackage(id: string, patch: Partial<SafariPackage>): Promise<boolean> {
     const pkg = state.packages.find((p) => p.id === id);
-    if (!pkg) return;
+    if (!pkg) return false;
+    const previous = state.packages;
     const next = { ...pkg, ...patch, updatedAt: new Date().toISOString() };
     state = { ...state, packages: state.packages.map((p) => (p.id === id ? next : p)) };
     logActivity("updated", "Package", id, pkg.title);
-    notify({ type: "success", title: "Package updated", message: `${pkg.title} saved.` });
     emit();
-    packageCloudSave(next);
+    const result = await packageCloudSave(next);
+    if (!result.ok) {
+      state = { ...state, packages: previous };
+      emit();
+      notify({ type: "error", title: "Package not saved", message: result.message.slice(0, 160) });
+      return false;
+    }
+    notify({ type: "success", title: "Package updated", message: `${pkg.title} saved and published to all devices.` });
+    return true;
   },
-  deletePackage(id: string) {
+  async deletePackage(id: string): Promise<void> {
     const pkg = state.packages.find((p) => p.id === id);
     if (!pkg) return;
-    // Archive rather than delete: bookings reference packages by title.
+    const previous = state.packages;
+    // Archive rather than hard delete: bookings reference packages by title.
     const next = { ...pkg, archived: true, published: false };
     state = { ...state, packages: state.packages.map((p) => (p.id === id ? next : p)) };
     logActivity("archived", "Package", id, pkg.title);
-    notify({ type: "info", title: "Package archived", message: `${pkg.title} is hidden from the public site.` });
     emit();
-    packageCloudSave(next);
+    const result = await packageCloudSave(next);
+    if (!result.ok) {
+      state = { ...state, packages: previous };
+      emit();
+      notify({ type: "error", title: "Package not archived", message: result.message.slice(0, 160) });
+      return;
+    }
+    notify({ type: "info", title: "Package archived", message: `${pkg.title} is hidden from the public site.` });
   },
   duplicatePackage(id: string) {
     const pkg = state.packages.find((p) => p.id === id);
     if (!pkg) return;
     const { slug: _slug, id: _id, createdAt: _c, updatedAt: _u, ...rest } = pkg;
-    actions.createPackage({ ...rest, title: `${pkg.title} (copy)`, published: false, featured: false });
+    void actions.createPackage({ ...rest, title: `${pkg.title} (copy)`, published: false, featured: false });
   },
 
   // Destinations
@@ -1613,6 +1850,7 @@ const actions = {
     logActivity("created", "Destination", id, entry.name);
     notify({ type: "success", title: "Destination created", message: `${entry.name} added.` });
     emit();
+    persistCollection("destinations");
     return entry;
   },
   updateDestination(id: string, patch: Partial<Destination>) {
@@ -1622,6 +1860,7 @@ const actions = {
     logActivity("updated", "Destination", id, d.name);
     notify({ type: "success", title: "Destination updated", message: `${d.name} saved.` });
     emit();
+    persistCollection("destinations");
   },
   deleteDestination(id: string) {
     const d = state.destinations.find((x) => x.id === id);
@@ -1630,6 +1869,7 @@ const actions = {
     logActivity("deleted", "Destination", id, d.name);
     notify({ type: "info", title: "Destination removed", message: `${d.name} removed.` });
     emit();
+    persistCollection("destinations");
   },
 
   // Media
@@ -1640,11 +1880,13 @@ const actions = {
     logActivity("created", "Media Asset", id, entry.name);
     notify({ type: "success", title: "Media uploaded", message: `${entry.name} added to library.` });
     emit();
+    persistCollection("media");
     return entry;
   },
   updateMedia(id: string, patch: Partial<MediaAsset>) {
     state = { ...state, media: state.media.map((m) => m.id === id ? { ...m, ...patch } : m) };
     emit();
+    persistCollection("media");
   },
   deleteMedia(id: string) {
     const m = state.media.find((x) => x.id === id);
@@ -1653,38 +1895,60 @@ const actions = {
     logActivity("archived", "Media Asset", id, m.name);
     notify({ type: "info", title: "Asset archived", message: `${m.name} hidden from library.` });
     emit();
+    persistCollection("media");
   },
 
   // Blog — write-through to Supabase so the public site stays synchronized.
-  createBlogPost(p: Omit<BlogPost, "id" | "createdAt" | "updatedAt">) {
+  async createBlogPost(p: Omit<BlogPost, "id" | "createdAt" | "updatedAt">): Promise<BlogPost | null> {
     // Must be a real uuid — blog_posts.id is a Postgres uuid column.
     const id = newBlogId();
     const entry: BlogPost = { ...p, id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     state = { ...state, blogPosts: [entry, ...state.blogPosts] };
     logActivity("created", "Blog Post", id, entry.title);
-    notify({ type: "success", title: "Article created", message: `${entry.title} added to drafts.` });
     emit();
-    blogCloudSave(entry);
+    const result = await blogCloudSave(entry);
+    if (!result.ok) {
+      state = { ...state, blogPosts: state.blogPosts.filter((x) => x.id !== id) };
+      emit();
+      notify({ type: "error", title: "Article not created", message: result.message.slice(0, 160) });
+      return null;
+    }
+    notify({ type: "success", title: "Article created", message: `${entry.title} added and is visible on the website.` });
     return entry;
   },
-  updateBlogPost(id: string, patch: Partial<BlogPost>) {
+  async updateBlogPost(id: string, patch: Partial<BlogPost>): Promise<boolean> {
     const p = state.blogPosts.find((x) => x.id === id);
-    if (!p) return;
+    if (!p) return false;
+    const previous = state.blogPosts;
     const next = { ...p, ...patch, updatedAt: new Date().toISOString() } as BlogPost;
     state = { ...state, blogPosts: state.blogPosts.map((x) => (x.id === id ? next : x)) };
     logActivity(patch.status === "published" ? "published" : "updated", "Blog Post", id, p.title);
-    notify({ type: "success", title: "Article updated", message: `${p.title} saved.` });
     emit();
-    blogCloudSave(next);
+    const result = await blogCloudSave(next);
+    if (!result.ok) {
+      state = { ...state, blogPosts: previous };
+      emit();
+      notify({ type: "error", title: "Article not saved", message: result.message.slice(0, 160) });
+      return false;
+    }
+    notify({ type: "success", title: "Article updated", message: `${p.title} saved and published to all devices.` });
+    return true;
   },
-  deleteBlogPost(id: string) {
+  async deleteBlogPost(id: string): Promise<void> {
     const p = state.blogPosts.find((x) => x.id === id);
     if (!p) return;
+    const previous = state.blogPosts;
     state = { ...state, blogPosts: state.blogPosts.filter((x) => x.id !== id) };
     logActivity("deleted", "Blog Post", id, p.title);
-    notify({ type: "info", title: "Article deleted", message: `${p.title} removed.` });
     emit();
-    blogCloudSave(null, id);
+    const result = await blogCloudSave(null, id);
+    if (!result.ok) {
+      state = { ...state, blogPosts: previous };
+      emit();
+      notify({ type: "error", title: "Article not deleted", message: result.message.slice(0, 160) });
+      return;
+    }
+    notify({ type: "info", title: "Article deleted", message: `${p.title} removed.` });
   },
 
   // ============ Testimonials ============
@@ -1898,6 +2162,7 @@ const actions = {
     logActivity("created", "Guide", id, entry.name);
     notify({ type: "success", title: "Guide added", message: `${entry.name} added to the roster.` });
     emit();
+    persistCollection("guides");
     return entry;
   },
   updateGuide(id: string, patch: Partial<Guide>) {
@@ -1907,6 +2172,7 @@ const actions = {
     logActivity("updated", "Guide", id, g.name);
     notify({ type: "success", title: "Guide updated", message: `${g.name} saved.` });
     emit();
+    persistCollection("guides");
   },
 
   /**
@@ -1947,6 +2213,7 @@ const actions = {
         ? `${target.name} archived. ${assigned} existing booking${assigned === 1 ? "" : "s"} keep their record.`
         : `${target.name} archived.`,
     });
+    persistCollection("guides");
   },
 
   // Vehicles
@@ -1957,6 +2224,7 @@ const actions = {
     logActivity("created", "Vehicle", id, entry.fleetCode);
     notify({ type: "success", title: "Vehicle added", message: `${entry.fleetCode} added to the fleet.` });
     emit();
+    persistCollection("vehicles");
     return entry;
   },
   updateVehicle(id: string, patch: Partial<Vehicle>) {
@@ -1966,6 +2234,7 @@ const actions = {
     logActivity("updated", "Vehicle", id, v.fleetCode);
     notify({ type: "success", title: "Vehicle updated", message: `${v.fleetCode} saved.` });
     emit();
+    persistCollection("vehicles");
   },
 
   /**
@@ -2006,6 +2275,7 @@ const actions = {
         ? `${target.fleetCode} archived. ${assigned} existing booking${assigned === 1 ? "" : "s"} keep their record.`
         : `${target.fleetCode} archived.`,
     });
+    persistCollection("vehicles");
   },
 
   /**
@@ -2046,6 +2316,7 @@ const actions = {
         ? `${target.name} archived. ${history} booking${history === 1 ? "" : "s"} and all invoices are preserved.`
         : `${target.name} archived.`,
     });
+    persistCollection("customers");
   },
 
   // Customers
@@ -2056,6 +2327,7 @@ const actions = {
     logActivity("updated", "Customer", id, c.name);
     notify({ type: "success", title: "Customer updated", message: `${c.name} saved.` });
     emit();
+    persistCollection("customers");
   },
 
   // Users
@@ -2152,23 +2424,60 @@ const actions = {
   },
 
   // Pages
-  updatePage(id: string, patch: Partial<PageSettings>) {
+  async updatePage(id: string, patch: Partial<PageSettings>): Promise<{ ok: boolean; message?: string }> {
     const p = state.pages.find((x) => x.id === id);
-    if (!p) return;
+    if (!p) return { ok: false, message: "Page not found." };
+    const previous = state.pages;
     state = { ...state, pages: state.pages.map((x) => x.id === id ? { ...x, ...patch, updatedAt: new Date().toISOString(), updatedBy: currentUser()?.id ?? "" } : x) };
     logActivity(patch.published === false ? "archived" : "updated", "Page", id, p.title);
-    notify({ type: "success", title: "Page updated", message: `${p.title} saved.` });
     emit();
-    void cloudSaveDocument("pages", state.pages);
+    const result = await cloudSaveDocument("pages", state.pages);
+    if (!result.ok) {
+      // Roll back so the UI never shows a "saved" value the database rejected.
+      state = { ...state, pages: previous };
+      emit();
+      notify({ type: "error", title: "Page could not be published", message: result.message.slice(0, 160) });
+      return { ok: false, message: result.message };
+    }
+    notify({ type: "success", title: "Page updated", message: `${p.title} saved and published to all devices.` });
+    return { ok: true };
   },
 
   // Site Settings — logo, brand colors, tagline, contact info, analytics.
-  updateSiteSettings(patch: Partial<SiteSettings>) {
+  async updateSiteSettings(patch: Partial<SiteSettings>): Promise<{ ok: boolean; message?: string }> {
+    const previous = state.siteSettings;
     state = { ...state, siteSettings: { ...state.siteSettings, ...patch } };
     logActivity("updated", "Site Settings", "global", "Global site settings");
-    notify({ type: "success", title: "Settings saved", message: "Global site settings updated on all devices." });
     emit();
-    void cloudSaveDocument("site_settings", state.siteSettings);
+    const result = await cloudSaveDocument("site_settings", state.siteSettings);
+    if (!result.ok) {
+      state = { ...state, siteSettings: previous };
+      emit();
+      notify({ type: "error", title: "Settings could not be saved", message: result.message.slice(0, 160) });
+      return { ok: false, message: result.message };
+    }
+    notify({ type: "success", title: "Settings saved", message: "Global site settings updated on all devices." });
+    return { ok: true };
+  },
+
+  /**
+   * Uploads a logo/favicon/asset file to Supabase Storage and persists the
+   * resulting public URL in Site Settings. The upload and the database write
+   * are both awaited and verified; a base64 data URL is never saved as the
+   * permanent logo.
+   */
+  async uploadSiteAsset(
+    file: File,
+    field: "logo" | "darkLogo" | "favicon",
+  ): Promise<{ ok: boolean; message?: string; url?: string }> {
+    if (!supabase) return { ok: false, message: "Supabase is not configured for this build." };
+    if (!file.type.startsWith("image/")) return { ok: false, message: "Choose an image file." };
+    const folder = field === "favicon" ? "branding/favicon" : "branding/logo";
+    const uploaded = await uploadToStorage(file, { folder, fileName: file.name, contentType: file.type });
+    if (!uploaded.ok) return { ok: false, message: uploaded.message };
+    const saved = await actions.updateSiteSettings({ [field]: uploaded.url } as Partial<SiteSettings>);
+    if (!saved.ok) return { ok: false, message: saved.message };
+    return { ok: true, url: uploaded.url };
   },
 
   resetDemoData() {

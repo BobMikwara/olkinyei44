@@ -1062,13 +1062,15 @@ function PublicApp() {
   const [selectedSafari, setSelectedSafari] = useState<SafariPackage | null>(null);
   const [bookingSafari, setBookingSafari] = useState<SafariPackage | null>(null);
   const [bookings, setBookings] = useState<Booking[]>(() => readStorage("olkinyei-bookings", []));
-  const [content] = useState<EditableContent>(() => readStorage("olkinyei-content", defaultContent));
   const cmsHomePage = useCmsStore((state) => state.pages.find((item) => item.route === "/"));
   const cmsSettings = useCmsStore((state) => state.siteSettings);
+  // Editable site copy comes from Supabase via the CMS store. The hardcoded
+  // defaults are only an offline fallback; a stale localStorage value is never
+  // allowed to override the live CMS value.
   const publicContent: EditableContent = {
-    homeStatement: String(cmsHomePage?.content.homeStatement || content.homeStatement),
-    conservationStatement: String(cmsHomePage?.content.conservationStatement || content.conservationStatement),
-    contactEmail: cmsSettings.contactEmail || content.contactEmail,
+    homeStatement: String(cmsHomePage?.content.homeStatement || defaultContent.homeStatement),
+    conservationStatement: String(cmsHomePage?.content.conservationStatement || defaultContent.conservationStatement),
+    contactEmail: cmsSettings.contactEmail || defaultContent.contactEmail,
   };
   const [postSlug, setPostSlug] = useState<string | null>(() => postSlugFromPath(window.location.pathname));
   const navigate = useCallback((next: Page) => { if (window.location.pathname !== ROUTES[next]) window.history.pushState({}, "", ROUTES[next]); setPage(next); setPostSlug(null); window.scrollTo({ top: 0, behavior: "instant" }); }, []);
