@@ -439,16 +439,19 @@ let cmsContentBootstrapped = false;
 function applyCloudSiteSettings(content: unknown) {
   if (!content || typeof content !== "object" || Array.isArray(content)) return;
   const incoming = content as Partial<SiteSettings>;
-  if (Object.keys(incoming).length === 0) return;
   // Cloud is authoritative: start from the seed defaults for any key the
-  // database has not explicitly set, then overlay the saved values.
+  // database has not explicitly set, then overlay the saved values. An
+  // empty object is a valid update and is applied (not rejected).
   state = { ...state, siteSettings: { ...seedSiteSettings, ...state.siteSettings, ...incoming } };
   emit();
 }
 
-function applyCloudPages(content: unknown) {
+function applyCloudPages(content: unknown, force = false) {
   if (!Array.isArray(content)) return;
-  if (content.length === 0) return; // keep seed pages until the CMS publishes one
+  // On initial load, keep seed pages until the CMS publishes at least one.
+  // During a Realtime event (force=true) an empty array means another
+  // device removed every page, so apply it to stay in sync.
+  if (content.length === 0 && !force) return;
   state = { ...state, pages: content as PageSettings[] };
   emit();
 }
@@ -536,9 +539,12 @@ const collectionBootstrapped: Record<CmsCollectionId, boolean> = {
   media: false,
 };
 
-function applyCloudCollection(id: CmsCollectionId, content: unknown): void {
+function applyCloudCollection(id: CmsCollectionId, content: unknown, force = false): void {
   if (!Array.isArray(content)) return;
-  if (content.length === 0) return; // keep seed content until the CMS publishes the first record
+  // On initial load, keep seed content until the CMS publishes at least one
+  // record. During a Realtime event (force=true) an empty array means another
+  // device removed every record, so apply it to stay in sync.
+  if (content.length === 0 && !force) return;
   switch (id) {
     case "destinations":
       state = { ...state, destinations: content as Destination[] };
@@ -789,15 +795,23 @@ if (typeof window !== "undefined" && supabase) {
   supabase
     .channel("olkinyei-cms-content")
     .on("postgres_changes", { event: "*", schema: "public", table: "cms_content" }, (payload) => {
-      const row = payload.new as { id?: string; content?: unknown };
+      // INSERT/UPDATE carry payload.new; DELETE carries only payload.old.
+      // Branch on eventType so deletions propagate to other browsers/devices.
+      const isDelete = payload.eventType === "DELETE";
+      const row = (isDelete ? payload.old : payload.new) as { id?: string; content?: unknown } | null;
       if (!row?.id) return;
-      if (row.id === "site_settings") applyCloudSiteSettings(row.content);
-      if (row.id === "pages") applyCloudPages(row.content);
-      if (row.id === "destinations") applyCloudCollection("destinations", row.content);
-      if (row.id === "guides") applyCloudCollection("guides", row.content);
-      if (row.id === "vehicles") applyCloudCollection("vehicles", row.content);
-      if (row.id === "customers") applyCloudCollection("customers", row.content);
-      if (row.id === "media") applyCloudCollection("media", row.content);
+      // On delete, reset the affected document to its empty form. On
+      // insert/update apply the incoming content. force=true so an empty
+      // collection (a remote 'remove all') overwrites local seed data.
+      const content = isDelete ? (row.id === "site_settings" ? {} : []) : row.content;
+      const force = isDelete;
+      if (row.id === "site_settings") applyCloudSiteSettings(content);
+      if (row.id === "pages") applyCloudPages(content, force);
+      if (row.id === "destinations") applyCloudCollection("destinations", content, force);
+      if (row.id === "guides") applyCloudCollection("guides", content, force);
+      if (row.id === "vehicles") applyCloudCollection("vehicles", content, force);
+      if (row.id === "customers") applyCloudCollection("customers", content, force);
+      if (row.id === "media") applyCloudCollection("media", content, force);
     })
     .on("postgres_changes", { event: "INSERT", schema: "public", table: "blog_posts" }, (payload) => {
       applyBlogRealtimeRow("INSERT", payload.new);
@@ -826,7 +840,31 @@ if (typeof window !== "undefined" && supabase) {
     .on("postgres_changes", { event: "DELETE", schema: "public", table: "packages" }, (payload) => {
       applyPackageRealtime("DELETE", payload.old);
     })
-    .subscribe();
+    .subscribe((status, err) => {
+      // Report subscription state so a misconfigured realtime publication
+      // or a transient disconnect is diagnosable instead of silently
+      // failing to sync. On (re)connect, re-fetch every collection so a
+      // browser that was offline catches up with changes it missed.
+      if (import.meta.env.DEV) {
+        if (status === "SUBSCRIBED") console.debug("[Olkinyei] Realtime connected");
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED" || err) {
+          console.error("[Olkinyei] Realtime subscription status:", status, err);
+        }
+      }
+      if (status === "SUBSCRIBED") {
+        // Reset the one-shot bootstrap guards and pull the latest rows.
+        cmsContentBootstrapped = false;
+        blogBootstrapped = false;
+        testimonialsBootstrapped = false;
+        packagesBootstrapped = false;
+        CMS_COLLECTION_IDS.forEach((id) => { collectionBootstrapped[id] = false; });
+        void loadCloudCmsContent();
+        void loadCloudBlogPosts();
+        void loadCloudTestimonials();
+        void loadCloudPackages();
+        void loadAllCloudCollections();
+      }
+    });
 
   // Boot the content. Public bundle shares this module, so visitors get
   // fresh brand settings on first paint as well.
