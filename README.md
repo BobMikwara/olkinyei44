@@ -26,7 +26,26 @@ Without Supabase credentials, the site enters a clearly labelled demonstration m
 ## Supabase Setup
 
 1. Create a Supabase project.
-2. Run `supabase/schema.sql` in the SQL editor.
+2. Run the SQL migrations below in the SQL editor, in order. Every file is
+   idempotent, but running them out of order can leave a table without the
+   columns or RLS policies the app relies on:
+   1. `supabase/schema.sql` — content tables + baseline RLS
+   2. `supabase/auth_schema_sync.sql` — profiles, roles, audit
+   3. `supabase/role_canonicalization.sql` — canonical role names
+   4. `supabase/packages_sync.sql` — safari packages + seed
+   5. `supabase/blog_posts_sync.sql` — journal posts
+   6. `supabase/testimonials_moderation.sql` — testimonial status + moderation
+   7. `supabase/testimonials_sources.sql` — ratings, sources, consent
+   8. `supabase/testimonials_publishing_fix.sql` — corrected testimonial read
+      policy (public may SELECT only `status = 'approved'` testimonials)
+   9. `supabase/bookings_hardening.sql` — booking RLS
+   10. `supabase/cms_content.sql` — site settings/pages documents
+   11. `supabase/cms_content_persistence.sql` — remaining CMS collections
+   12. `supabase/storage_persistence.sql` — media bucket policies
+
+   In particular, testimonials will not appear on the public website unless
+   the testimonial migrations (6–8) have run: the site filters on the
+   `status` column and `status = 'approved'` read policy those files install.
 3. Create the first staff user in Authentication.
 4. Add a matching row to `public.profiles` with the user's auth UUID and role `admin`.
 5. Enable Realtime for `public.bookings` if the final statement in the schema is skipped by an existing publication.

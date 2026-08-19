@@ -23,9 +23,17 @@ Run the migrations in this order: `supabase/schema.sql` → `supabase/production
 Run in order inside the Supabase SQL editor:
 
 1. `supabase/schema.sql` — content tables + baseline RLS
-2. `supabase/production_auth.sql` — hardened profiles, audit logs, root triggers
-3. `supabase/packages_sync.sql` — Safari Packages (`public.packages`) canonical schema, RLS, and seed data (the single source of truth shared by the CMS and the public website)
-4. `supabase/cms_tokens.sql` — offline-mode setup tokens (optional fallback tables)
+2. `supabase/auth_schema_sync.sql` — profiles, roles, audit
+3. `supabase/role_canonicalization.sql` — canonical role names
+4. `supabase/packages_sync.sql` — Safari Packages (`public.packages`) canonical schema, RLS, and seed data (the single source of truth shared by the CMS and the public website)
+5. `supabase/blog_posts_sync.sql` — journal posts
+6. `supabase/testimonials_moderation.sql` — testimonial status + moderation columns
+7. `supabase/testimonials_sources.sql` — ratings, consent, review sources
+8. `supabase/testimonials_publishing_fix.sql` — corrected read policy (public may SELECT only `status = 'approved'` testimonials)
+9. `supabase/bookings_hardening.sql` — booking RLS
+10. `supabase/cms_content.sql` — site settings/pages documents
+11. `supabase/cms_content_persistence.sql` — remaining CMS collections
+12. `supabase/storage_persistence.sql` — media bucket policies
 
 `production_auth.sql` grants no client insert/update/delete on `profiles`, adds `audit_logs`, and installs triggers that make the Root Super Admin immutable from the client.
 

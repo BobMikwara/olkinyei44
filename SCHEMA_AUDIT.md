@@ -137,9 +137,19 @@ row model. No code references a non-existent column.
 3. supabase/role_canonicalization.sql   ← new, required
 4. supabase/packages_sync.sql           ← Safari Packages schema + RLS + seed
 5. supabase/blog_posts_sync.sql
-6. supabase/bookings_hardening.sql
-7. supabase/cms_content.sql
+6. supabase/testimonials_moderation.sql ← testimonial status + moderation columns
+7. supabase/testimonials_sources.sql    ← ratings, consent, review sources
+8. supabase/testimonials_publishing_fix.sql ← corrected public read policy
+9. supabase/bookings_hardening.sql
+10. supabase/cms_content.sql
+11. supabase/cms_content_persistence.sql
+12. supabase/storage_persistence.sql
 ```
+
+The testimonial migrations (6–8) are required for CMS-published testimonials
+to appear publicly: the site filters on `status = 'approved'`, and the
+`testimonials_publishing_fix.sql` migration installs the read policy that lets
+anonymous visitors SELECT only approved rows.
 
 Verification query — must return zero rows:
 

@@ -1060,7 +1060,11 @@ type DbTestimonialRow = {
   rating: number | null;
   safari_package: string | null;
   consent_given: boolean | null;
-  status: TestimonialStatus;
+  // `published` predates moderation; it is kept in lock-step with `status` by
+  // the database trigger, but rows written before the moderation migration may
+  // carry only this legacy flag. Reading it here lets us normalise old rows.
+  published: boolean | null;
+  status: TestimonialStatus | null;
   flagged: boolean;
   flag_reason: string | null;
   staff_notes: string | null;
@@ -1074,11 +1078,24 @@ type DbTestimonialRow = {
   sort_order: number;
   moderated_by: string | null;
   moderated_at: string | null;
-  created_at: string;
-  updated_at: string;
+  created_at: string | null;
+  updated_at: string | null;
 };
 
 function testimonialFromRow(row: DbTestimonialRow): Testimonial {
+  // Normalise the moderation state into the canonical `status` vocabulary.
+  // Newer rows carry `status` ('pending'|'approved'|'rejected'|'flagged');
+  // rows written before the moderation migration only carry the legacy
+  // `published` boolean. Deriving `status` from `published` here keeps both
+  // generations consistent with the public filter (`status === "approved"`)
+  // instead of silently dropping live testimonials.
+  const canonicalStatus: TestimonialStatus =
+    row.status === "pending" || row.status === "approved" || row.status === "rejected" || row.status === "flagged"
+      ? row.status
+      : row.published
+        ? "approved"
+        : "pending";
+  const createdAt = row.created_at ?? row.updated_at ?? new Date().toISOString();
   return {
     id: row.id,
     quote: row.quote,
@@ -1089,7 +1106,7 @@ function testimonialFromRow(row: DbTestimonialRow): Testimonial {
     rating: row.rating ?? undefined,
     safariPackage: row.safari_package ?? undefined,
     consentGiven: Boolean(row.consent_given),
-    status: row.status,
+    status: canonicalStatus,
     flagged: Boolean(row.flagged),
     flagReason: row.flag_reason ?? undefined,
     staffNotes: row.staff_notes ?? undefined,
@@ -1104,8 +1121,8 @@ function testimonialFromRow(row: DbTestimonialRow): Testimonial {
     sortOrder: row.sort_order ?? 0,
     moderatedBy: row.moderated_by ?? undefined,
     moderatedAt: row.moderated_at ?? undefined,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at ?? row.created_at,
+    createdAt,
+    updatedAt: row.updated_at ?? createdAt,
   };
 }
 
@@ -1117,16 +1134,34 @@ async function loadCloudTestimonials(): Promise<void> {
   if (!client || testimonialsBootstrapped) return;
   testimonialsBootstrapped = true;
   try {
-    const { data, error } = await client
+    // `created_at` is added by the testimonials moderation migration; a
+    // database still on the baseline schema only has `sort_order`. Falling
+    // back instead of failing the whole request keeps the public testimonial
+    // section rendering instead of appearing silently empty. The store
+    // re-sorts on render anyway.
+    let result = await client
       .from(TABLES.testimonials)
       .select("*")
       .order("created_at", { ascending: false });
-    if (error) throw new Error(error.message);
-    state = { ...state, testimonials: (data as DbTestimonialRow[]).map(testimonialFromRow) };
+    if (result.error) {
+      result = await client
+        .from(TABLES.testimonials)
+        .select("*")
+        .order("sort_order", { ascending: true });
+    }
+    if (result.error) throw new Error(result.error.message);
+    const rows = (result.data ?? []) as DbTestimonialRow[];
+    state = { ...state, testimonials: rows.map(testimonialFromRow) };
     emit();
   } catch (error) {
     testimonialsBootstrapped = false;
-    if (import.meta.env.DEV) console.warn("[Olkinyei] Could not load testimonials:", error);
+    // Loud on purpose: an empty testimonial section in production is almost
+    // always a schema/RLS problem and must not fail silently.
+    console.error(
+      "[Olkinyei] Could not load testimonials from Supabase:",
+      error instanceof Error ? error.message : error,
+      "\nRun supabase/testimonials_publishing_fix.sql, then confirm anonymous SELECT is permitted on public.testimonials.",
+    );
   }
 }
 
@@ -2062,6 +2097,7 @@ const actions = {
     const target = state.testimonials.find((t) => t.id === id);
     if (!target) return;
 
+    const previous = state.testimonials;
     state = {
       ...state,
       testimonials: state.testimonials.map((t) => (t.id === id
@@ -2088,6 +2124,14 @@ const actions = {
         })
         .eq("id", id);
       if (error) {
+        // Roll back the optimistic change: the CMS must never show a
+        // testimonial as published when the database rejected the write
+        // (missing `status` column, RLS denial, etc.). This was the exact
+        // path by which the CMS looked "published" while the public site saw
+        // nothing.
+        state = { ...state, testimonials: previous };
+        emit();
+        audit(`testimonial.${status}`, "testimonial", "failure", { actorId: actor.id, actorEmail: actor.email, targetId: id, reason: error.message });
         notify({ type: "error", title: "Moderation failed", message: error.message });
         return;
       }
@@ -2112,6 +2156,7 @@ const actions = {
     const target = state.testimonials.find((t) => t.id === id);
     if (!target) return;
 
+    const previous = state.testimonials;
     state = { ...state, testimonials: state.testimonials.map((t) => (t.id === id ? { ...t, ...patch } : t)) };
     emit();
 
@@ -2125,7 +2170,13 @@ const actions = {
       if (patch.sortOrder !== undefined) row.sort_order = patch.sortOrder;
       if (Object.keys(row).length > 0) {
         const { error } = await supabase.from(TABLES.testimonials).update(row).eq("id", id);
-        if (error) { notify({ type: "error", title: "Save failed", message: error.message }); return; }
+        if (error) {
+          state = { ...state, testimonials: previous };
+          emit();
+          audit("testimonial.updated", "testimonial", "failure", { actorId: actor.id, targetId: id, reason: error.message });
+          notify({ type: "error", title: "Save failed", message: error.message });
+          return;
+        }
       }
     }
     audit("testimonial.updated", "testimonial", "success", { actorId: actor.id, targetId: id });
@@ -2141,12 +2192,19 @@ const actions = {
     const target = state.testimonials.find((t) => t.id === id);
     if (!target) return;
 
+    const previous = state.testimonials;
     state = { ...state, testimonials: state.testimonials.filter((t) => t.id !== id) };
     emit();
 
     if (supabase) {
       const { error } = await supabase.from(TABLES.testimonials).delete().eq("id", id);
-      if (error) { notify({ type: "error", title: "Delete failed", message: error.message }); return; }
+      if (error) {
+        state = { ...state, testimonials: previous };
+        emit();
+        audit("testimonial.deleted", "testimonial", "failure", { actorId: actor.id, targetId: id, reason: error.message });
+        notify({ type: "error", title: "Delete failed", message: error.message });
+        return;
+      }
     }
     audit("testimonial.deleted", "testimonial", "success", { actorId: actor.id, targetId: id });
     logActivity("deleted", "Testimonial", id, target.guestName);
