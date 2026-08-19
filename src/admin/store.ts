@@ -1809,7 +1809,19 @@ const actions = {
     if (supabase) {
       const { error } = await supabase
         .from(TABLES.testimonials)
-        .update({ status, flagged: status === "flagged", moderated_by: actor.id, moderated_at: new Date().toISOString() })
+        .update({
+          status,
+          flagged: status === "flagged",
+          // Keep the legacy `published` flag in lock-step with `status` so an
+          // approved testimonial is publicly visible regardless of which RLS
+          // policy/trigger version is installed. The canonical public policy
+          // reads status = 'approved' (which the frontend filters by); the
+          // baseline policy reads published = true. Setting both here covers
+          // both, and the DB trigger enforces the same invariant.
+          published: status === "approved",
+          moderated_by: actor.id,
+          moderated_at: new Date().toISOString(),
+        })
         .eq("id", id);
       if (error) {
         notify({ type: "error", title: "Moderation failed", message: error.message });
