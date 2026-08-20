@@ -7,9 +7,21 @@
 -- by this file's role handling), or run it on top of them — legacy role
 -- values are migrated to canonical names below.
 --
--- Canonical role names used by EVERY layer of the application:
---   root_super_admin · super_admin · content_manager · editor
---   reservation_manager · marketing · finance
+-- Canonical role names used by EVERY layer of the application (they mirror
+-- src/admin/constants.ts ROLES and supabase/role_canonicalization.sql):
+--   root · super_admin · content_manager · booking_manager
+--   marketing_manager · finance
+--
+-- HISTORY / WHY THIS FILE WAS REWRITTEN: an earlier revision of this file
+-- migrated roles in the OPPOSITE direction (canonical → legacy names such as
+-- root_super_admin / reservation_manager / marketing) while
+-- role_canonicalization.sql migrated legacy → canonical. Whichever file ran
+-- last silently flipped the vocabulary, and any is_staff() definition from
+-- the other file then returned FALSE for real staff — which made RLS filter
+-- their UPDATEs (testimonials, packages) into silent zero-row no-ops. Both
+-- files now migrate to the SAME canonical vocabulary, and every staff
+-- predicate below tolerates legacy spellings so a database stuck in a mixed
+-- state still authorises its staff correctly.
 --
 -- Canonical statuses: active · pending · suspended · deleted
 --
@@ -41,19 +53,24 @@ create unique index if not exists profiles_email_key on public.profiles (lower(e
 
 -- ============ 2. Normalise every legacy role value to canonical names ============
 -- Order matters: run the mapping BEFORE tightening the CHECK constraint.
+-- Drop the constraint first so rows can be rewritten whichever vocabulary the
+-- current constraint enforces.
 
-update public.profiles set role = 'root_super_admin'     where role in ('root');
-update public.profiles set role = 'super_admin'          where role in ('admin');
-update public.profiles set role = 'reservation_manager'  where role in ('booking_manager', 'reservation', 'bookings');
-update public.profiles set role = 'marketing'            where role in ('marketing_manager');
-update public.profiles set role = 'content_manager'      where role not in (
-  'root_super_admin', 'super_admin', 'content_manager', 'editor',
-  'reservation_manager', 'marketing', 'finance'
-) or role is null;
+alter table public.profiles drop constraint if exists profiles_role_check;
+alter table public.profiles drop constraint if exists profiles_role_check2;
+alter table public.profiles drop constraint if exists profiles_status_check;
+
+update public.profiles set role = 'root'              where role in ('root_super_admin');
+update public.profiles set role = 'super_admin'       where role in ('admin');
+update public.profiles set role = 'booking_manager'   where role in ('reservation_manager', 'reservation', 'bookings');
+update public.profiles set role = 'marketing_manager' where role in ('marketing');
+update public.profiles set role = 'content_manager'   where role in ('editor')
+   or role is null
+   or role not in ('root', 'super_admin', 'content_manager', 'booking_manager', 'marketing_manager', 'finance');
 
 -- Protect historical root flags: any row previously created as root keeps it.
-update public.profiles set is_root = true, role = 'root_super_admin'
-  where role = 'root_super_admin';
+update public.profiles set is_root = true, role = 'root'
+  where role = 'root';
 
 -- Default status for existing rows.
 update public.profiles set status = 'active' where status is null;
@@ -62,20 +79,19 @@ alter table public.profiles alter column role set default 'content_manager';
 alter table public.profiles alter column status set default 'pending';
 
 alter table public.profiles
-  drop constraint if exists profiles_role_check,
-  drop constraint if exists profiles_status_check,
-  drop constraint if exists profiles_role_check2;
-
-alter table public.profiles
   add constraint profiles_role_check
   check (role in (
-    'root_super_admin', 'super_admin', 'content_manager', 'editor',
-    'reservation_manager', 'marketing', 'finance'
+    'root', 'super_admin', 'content_manager', 'booking_manager',
+    'marketing_manager', 'finance'
   )),
   add constraint profiles_status_check
   check (status in ('active', 'pending', 'suspended', 'deleted'));
 
--- ============ 3. Staff predicates (canonical names everywhere) ============
+-- ============ 3. Staff predicates ============
+-- Canonical names first; legacy spellings are ACCEPTED (never granted) so a
+-- database that has not finished migrating cannot lock its own staff out and
+-- silently break CMS writes. Legacy names map to staff roles only — this is
+-- not a privilege escalation.
 
 create or replace function public.is_root_admin()
 returns boolean
@@ -88,7 +104,7 @@ as $$
     select 1 from public.profiles
     where id = auth.uid()
       and status = 'active'
-      and (is_root = true or role = 'root_super_admin')
+      and (is_root = true or role in ('root', 'root_super_admin'))
   );
 $$;
 
@@ -103,7 +119,7 @@ as $$
     select 1 from public.profiles
     where id = auth.uid()
       and status = 'active'
-      and (is_root = true or role in ('root_super_admin', 'super_admin'))
+      and (is_root = true or role in ('root', 'root_super_admin', 'super_admin', 'admin'))
   );
 $$;
 
@@ -118,11 +134,15 @@ as $$
     select 1 from public.profiles
     where id = auth.uid()
       and status = 'active'
-      and (is_root = true or role in ('root_super_admin', 'super_admin', 'reservation_manager'))
+      and (is_root = true or role in (
+        'root', 'root_super_admin', 'super_admin', 'admin',
+        'booking_manager', 'reservation_manager', 'reservation', 'bookings'
+      ))
   );
 $$;
 
--- General staff check retained for content tables referenced by schema.sql.
+-- General staff check referenced by the content-table policies
+-- (testimonials, packages, blog_posts, gallery, guides, cms_content …).
 create or replace function public.is_staff()
 returns boolean
 language sql
@@ -137,8 +157,11 @@ as $$
       and (
         is_root = true
         or role in (
-          'root_super_admin', 'super_admin', 'content_manager', 'editor',
-          'reservation_manager', 'marketing', 'finance'
+          'root', 'root_super_admin', 'super_admin', 'admin',
+          'content_manager', 'editor',
+          'booking_manager', 'reservation_manager', 'reservation', 'bookings',
+          'marketing_manager', 'marketing',
+          'finance'
         )
       )
   );
@@ -166,7 +189,8 @@ as $$
 begin
   -- Root rows are immutable through the client: no demotion, no un-rooting,
   -- no suspension, no deletion, no id change. The service role bypasses.
-  if old.is_root = true or old.role = 'root_super_admin' then
+  -- Both role spellings are guarded so a half-migrated row stays protected.
+  if old.is_root = true or old.role in ('root', 'root_super_admin') then
     if public.is_root_service() then
       return new;
     end if;
@@ -174,7 +198,7 @@ begin
   end if;
 
   -- Client code can never grant the root role or root flag.
-  if (new.role = 'root_super_admin' or new.is_root = true) and not public.is_root_service() then
+  if (new.role in ('root', 'root_super_admin') or new.is_root = true) and not public.is_root_service() then
     raise exception 'The Root Super Admin cannot be created from the client';
   end if;
 
@@ -194,7 +218,7 @@ security definer
 set search_path = public
 as $$
 begin
-  if (old.is_root = true or old.role = 'root_super_admin') and not public.is_root_service() then
+  if (old.is_root = true or old.role in ('root', 'root_super_admin')) and not public.is_root_service() then
     raise exception 'The Root Super Admin cannot be deleted';
   end if;
   return old;
@@ -293,6 +317,10 @@ drop policy if exists "Booking staff can update bookings" on public.bookings;
 drop policy if exists "Only root can delete bookings" on public.bookings;
 drop policy if exists "Staff can read bookings" on public.bookings;
 drop policy if exists "Staff can update bookings" on public.bookings;
+-- Also drop the insert policy created by schema.sql before re-creating it:
+-- without this drop, a re-run aborted here (42710 duplicate policy) and the
+-- WHOLE file rolled back, leaving the role predicates half-installed.
+drop policy if exists "Public can create booking requests" on public.bookings;
 
 create policy "Public can create booking requests" on public.bookings
   for insert to anon, authenticated
@@ -327,12 +355,12 @@ create policy "Only root can delete bookings" on public.bookings
 --     '<auth-user-uuid>',
 --     'root@example.com',
 --     'Root Super Admin',
---     'root_super_admin',
+--     'root',
 --     'active',
 --     true
 --   )
 --   on conflict (id) do update
---     set role = 'root_super_admin', is_root = true, status = 'active';
+--     set role = 'root', is_root = true, status = 'active';
 --
 -- CREATE TABLE STEP complete. Authentication reconciled.
 -- ============================================================================

@@ -12,9 +12,22 @@ const SUPABASE_URL = process.env.VITE_SUPABASE_URL ?? process.env.SUPABASE_URL ?
 const SUPABASE_ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY ?? process.env.SUPABASE_ANON_KEY ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 
-// Canonical values only.
-const ROOT_SCOPE = new Set(["root_super_admin"]);
-const ALLOWED_ROLES = new Set(["super_admin", "content_manager", "editor", "reservation_manager", "marketing", "finance"]);
+// Canonical role vocabulary (mirrors src/admin/constants.ts and
+// supabase/role_canonicalization.sql). Legacy spellings are accepted as
+// input and normalised to canonical before comparison or storage.
+const ROOT_SCOPE = new Set(["root", "root_super_admin"]);
+const CANONICAL_ROLES = new Set(["super_admin", "content_manager", "booking_manager", "marketing_manager", "finance"]);
+const LEGACY_ROLE_ALIASES: Record<string, string> = {
+  admin: "super_admin",
+  editor: "content_manager",
+  reservation_manager: "booking_manager",
+  reservation: "booking_manager",
+  bookings: "booking_manager",
+  marketing: "marketing_manager",
+};
+function canonicalRole(role: string): string {
+  return LEGACY_ROLE_ALIASES[role] ?? role;
+}
 const ALLOWED_ACTIONS = new Set(["suspend", "reactivate", "delete", "set_role"]);
 
 const buckets = new Map<string, { count: number; resetAt: number }>();
@@ -93,10 +106,10 @@ export default async function handler(request: Request): Promise<Response> {
 
   const action = String(body.action ?? "");
   const userId = String(body.userId ?? "");
-  const role = body.role ? String(body.role) : undefined;
+  const role = body.role ? canonicalRole(String(body.role)) : undefined;
 
   if (!ALLOWED_ACTIONS.has(action) || !userId) return json(400, { error: "Invalid request" });
-  if (action === "set_role" && (!role || !ALLOWED_ROLES.has(role))) return json(400, { error: "Unsupported role" });
+  if (action === "set_role" && (!role || !CANONICAL_ROLES.has(role))) return json(400, { error: "Unsupported role" });
   if (userId === caller.id && (action === "delete" || action === "suspend")) {
     return json(400, { error: "You cannot perform that action on your own account" });
   }
@@ -113,7 +126,8 @@ export default async function handler(request: Request): Promise<Response> {
   if (Boolean(target.is_root) || ROOT_SCOPE.has(String(target.role ?? ""))) {
     return json(403, { error: "The Root Super Admin cannot be modified" });
   }
-  if (action === "delete" && target.role === "super_admin" && !callerIsRoot) {
+  const targetRole = canonicalRole(String(target.role ?? ""));
+  if (action === "delete" && targetRole === "super_admin" && !callerIsRoot) {
     return json(403, { error: "Only the Root Super Admin can delete Super Admin accounts" });
   }
   if (action === "set_role" && role === "super_admin" && !callerIsRoot) {

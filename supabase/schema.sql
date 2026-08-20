@@ -2,14 +2,17 @@ create extension if not exists "pgcrypto";
 
 -- NOTE: supabase/auth_schema_sync.sql is the authoritative auth schema and
 -- normalises every role value to the canonical names. Run it after this file.
--- The baseline check below already uses canonical names.
+-- The baseline check below uses the canonical names (mirrors
+-- src/admin/constants.ts ROLES); auth_schema_sync.sql migrates any legacy
+-- values (root_super_admin / reservation_manager / marketing / editor) that
+-- predate canonicalisation.
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   full_name text,
   email text,
   role text not null default 'content_manager' check (role in (
-    'root_super_admin', 'super_admin', 'content_manager', 'editor',
-    'reservation_manager', 'marketing', 'finance'
+    'root', 'super_admin', 'content_manager', 'booking_manager',
+    'marketing_manager', 'finance'
   )),
   status text not null default 'pending' check (status in ('active', 'pending', 'suspended', 'deleted')),
   avatar_url text,
@@ -148,8 +151,13 @@ as $$
       and (
         is_root = true
         or role in (
-          'root_super_admin', 'super_admin', 'content_manager', 'editor',
-          'reservation_manager', 'marketing', 'finance'
+          -- Canonical names (src/admin/constants.ts) plus legacy spellings,
+          -- so a database mid-migration never locks staff out of RLS writes.
+          'root', 'root_super_admin', 'super_admin', 'admin',
+          'content_manager', 'editor',
+          'booking_manager', 'reservation_manager', 'reservation', 'bookings',
+          'marketing_manager', 'marketing',
+          'finance'
         )
       )
   );
@@ -180,7 +188,7 @@ create policy "Staff can read bookings" on public.bookings for select to authent
     select 1 from public.profiles
     where id = auth.uid()
       and status = 'active'
-      and (is_root = true or role in ('root_super_admin', 'super_admin', 'reservation_manager'))
+      and (is_root = true or role in ('root', 'root_super_admin', 'super_admin', 'admin', 'booking_manager', 'reservation_manager'))
   )
 );
 create policy "Staff can update bookings" on public.bookings for update to authenticated using (
@@ -188,14 +196,14 @@ create policy "Staff can update bookings" on public.bookings for update to authe
     select 1 from public.profiles
     where id = auth.uid()
       and status = 'active'
-      and (is_root = true or role in ('root_super_admin', 'super_admin', 'reservation_manager'))
+      and (is_root = true or role in ('root', 'root_super_admin', 'super_admin', 'admin', 'booking_manager', 'reservation_manager'))
   )
 ) with check (
   exists (
     select 1 from public.profiles
     where id = auth.uid()
       and status = 'active'
-      and (is_root = true or role in ('root_super_admin', 'super_admin', 'reservation_manager'))
+      and (is_root = true or role in ('root', 'root_super_admin', 'super_admin', 'admin', 'booking_manager', 'reservation_manager'))
   )
 );
 create policy "Only root can delete bookings" on public.bookings for delete to authenticated using (
@@ -203,7 +211,7 @@ create policy "Only root can delete bookings" on public.bookings for delete to a
     select 1 from public.profiles
     where id = auth.uid()
       and status = 'active'
-      and (is_root = true or role = 'root_super_admin')
+      and (is_root = true or role in ('root', 'root_super_admin'))
   )
 );
 create policy "Public can read published packages" on public.packages for select using (published = true or public.is_staff());

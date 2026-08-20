@@ -65,7 +65,7 @@ as $$
       and (
         is_root = true
         or role in (
-          'root', 'root_super_admin', 'super_admin',
+          'root', 'root_super_admin', 'super_admin', 'admin',
           'content_manager', 'editor',
           'booking_manager', 'reservation_manager', 'reservation', 'bookings',
           'marketing_manager', 'marketing',

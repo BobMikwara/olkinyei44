@@ -129,16 +129,81 @@ row model. No code references a non-existent column.
 
 ---
 
+## 8. Role-vocabulary ping-pong between migrations — FIXED (root cause of CMS saves not persisting)
+
+`supabase/auth_schema_sync.sql` and `supabase/role_canonicalization.sql` both
+claimed to be authoritative and idempotent, but migrated `profiles.role` in
+**opposite directions**:
+
+| File | Migrated roles to | `is_staff()` accepted |
+| ---- | ----------------- | --------------------- |
+| `auth_schema_sync.sql` (old) | legacy (`root_super_admin`, `reservation_manager`, `marketing`, `editor`) | legacy only |
+| `role_canonicalization.sql` | canonical (`root`, `booking_manager`, `marketing_manager`, …) | canonical only |
+
+Whichever ran last flipped the vocabulary; the *other* file's `is_staff()`
+then returned **false** for real staff. Because every content policy is
+`using (public.is_staff())`, staff UPDATEs on `testimonials` and `packages`
+were filtered by RLS into **silent zero-row no-ops** — PostgREST returns no
+error for an UPDATE that matches no rows, so the CMS reported "Saved" while
+the database never changed. `auth_schema_sync.sql` additionally aborted on
+re-run (it recreated `"Public can create booking requests"` without dropping
+it first), leaving databases in mixed states.
+
+**After:**
+
+- Both files now migrate to the **canonical** vocabulary
+  (`root · super_admin · content_manager · booking_manager ·
+  marketing_manager · finance`).
+- All four staff predicates (`is_staff`, `is_root_admin`, `is_super_admin`,
+  `is_booking_staff`) share one body across every migration file and
+  **tolerate legacy spellings** (accepted, never granted), so a
+  partially-migrated database can no longer lock its own staff out of RLS.
+- The missing `drop policy` was added so `auth_schema_sync.sql` re-runs
+  cleanly.
+- `api/invite-user.ts` / `api/manage-user.ts` accepted only legacy role names
+  while the CMS sends canonical ones; they now accept either and normalise to
+  canonical before storing.
+
+**Action required on the live database:** re-run
+`supabase/auth_schema_sync.sql` then `supabase/role_canonicalization.sql`
+(both idempotent, no data deleted). This repairs `profiles.role` values and
+reinstalls consistent predicates.
+
+---
+
+## 9. Silent zero-row writes in the client — FIXED
+
+`updateTestimonial`, `setTestimonialStatus`, and `deleteTestimonial` called
+`.update()/.delete().eq("id", id)` and only checked `error`. An RLS-filtered
+write returns **no error and zero rows**, so the CMS claimed success, kept the
+optimistic local edit, and never rolled back — the exact "saved here, gone on
+the next device" symptom.
+
+Every testimonial write now appends `.select()`, requires at least one
+returned row, rolls the optimistic UI back on failure, and **adopts the
+returned database row** into state (re-fetch-after-save semantics, so
+trigger-trimmed values and `updated_at` are what the CMS displays).
+`packageCloudSave` and `blogCloudSave` upserts likewise require the stored row
+back and replace the optimistic copy with it. Update payloads remain
+deliberately constructed from real column names only (`packageToRow`, the
+field-by-field testimonial row) — no UI-only properties are ever sent.
+
+---
+
 ## Migration order
 
 ```
 1. supabase/schema.sql
-2. supabase/auth_schema_sync.sql
-3. supabase/role_canonicalization.sql   ← new, required
+2. supabase/auth_schema_sync.sql        ← rewritten: canonical roles, safe re-run
+3. supabase/role_canonicalization.sql   ← required; re-run to repair predicate drift
 4. supabase/packages_sync.sql           ← Safari Packages schema + RLS + seed
-5. supabase/blog_posts_sync.sql
-6. supabase/bookings_hardening.sql
-7. supabase/cms_content.sql
+5. supabase/testimonials_moderation.sql
+6. supabase/testimonials_sources.sql
+7. supabase/blog_posts_sync.sql
+8. supabase/bookings_hardening.sql
+9. supabase/cms_content.sql
+10. supabase/cms_content_persistence.sql
+11. supabase/storage_persistence.sql
 ```
 
 Verification query — must return zero rows:

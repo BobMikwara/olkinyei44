@@ -1063,8 +1063,27 @@ async function packageCloudSave(
     if (!pkg) return { ok: false, message: "No package supplied." };
     const row = packageToRow(pkg);
     if (UUID_PATTERN.test(pkg.id)) {
-      const { error } = await client.from(TABLES.packages).upsert(row, { onConflict: "id" });
+      // `.select().single()` makes the write verifiable: if RLS filtered the
+      // row (e.g. the staff predicate rejected this account) the upsert would
+      // otherwise report success while updating nothing. Requiring the stored
+      // row back guarantees the database actually changed, and the returned
+      // record (post-trigger: updated_at, trimmed values) replaces the
+      // optimistic local copy so the CMS displays exactly what is stored.
+      const { data, error } = await client
+        .from(TABLES.packages)
+        .upsert(row, { onConflict: "id" })
+        .select("*")
+        .single();
       if (error) throw error;
+      if (!data) {
+        return {
+          ok: false,
+          message: "The database did not confirm the save. Your account may lack staff permissions (RLS). No change was stored.",
+        };
+      }
+      const stored = packageFromRow(data as DbPackageRow);
+      state = { ...state, packages: state.packages.map((p) => (p.id === stored.id ? stored : p)) };
+      emit();
       return { ok: true };
     }
     // Seed ids ("p1") are not uuids: let Postgres mint one, keyed by slug.
@@ -1072,11 +1091,12 @@ async function packageCloudSave(
     const { data, error } = await client
       .from(TABLES.packages)
       .upsert(withoutId, { onConflict: "slug" })
-      .select("id")
+      .select("*")
       .single();
     if (error) throw error;
-    const cloudId = (data as { id: string }).id;
-    state = { ...state, packages: state.packages.map((p) => (p.id === pkg.id ? { ...p, id: cloudId } : p)) };
+    if (!data) return { ok: false, message: "The database did not confirm the save. No change was stored." };
+    const stored = packageFromRow(data as DbPackageRow);
+    state = { ...state, packages: state.packages.map((p) => (p.id === pkg.id ? stored : p)) };
     emit();
     return { ok: true };
   } catch (error) {
@@ -1208,8 +1228,15 @@ async function blogCloudSave(
     const row = blogPostToRow(post);
 
     if (UUID_PATTERN.test(post.id)) {
-      const { error } = await client.from(TABLES.blogPosts).upsert(row, { onConflict: "id" });
+      // Verified write: require the stored row's id back so an RLS-filtered
+      // upsert can never masquerade as a successful save.
+      const { data, error } = await client
+        .from(TABLES.blogPosts)
+        .upsert(row, { onConflict: "id" })
+        .select("id")
+        .single();
       if (error) throw error;
+      if (!data) return { ok: false, message: "The database did not confirm the save. No change was stored." };
       return { ok: true };
     }
 
@@ -2091,15 +2118,17 @@ const actions = {
   },
 
   /** Staff moderation: approve, reject, flag, or return to the queue. */
-  async setTestimonialStatus(id: string, status: TestimonialStatus): Promise<void> {
+  async setTestimonialStatus(id: string, status: TestimonialStatus): Promise<boolean> {
     const actor = currentUser();
     if (!actor || !can(actor, "blog", "publish")) {
       notify({ type: "error", title: "Not permitted", message: "You do not have permission to moderate testimonials." });
-      return;
+      return false;
     }
     const target = state.testimonials.find((t) => t.id === id);
-    if (!target) return;
+    if (!target) return false;
 
+    // Optimistic UI, retained only if the database confirms the write.
+    const previous = state.testimonials;
     state = {
       ...state,
       testimonials: state.testimonials.map((t) => (t.id === id
@@ -2108,28 +2137,47 @@ const actions = {
     };
     emit();
 
-    if (supabase) {
-      const { error } = await supabase
-        .from(TABLES.testimonials)
-        .update({
-          status,
-          flagged: status === "flagged",
-          // Keep the legacy `published` flag in lock-step with `status` so an
-          // approved testimonial is publicly visible regardless of which RLS
-          // policy/trigger version is installed. The canonical public policy
-          // reads status = 'approved' (which the frontend filters by); the
-          // baseline policy reads published = true. Setting both here covers
-          // both, and the DB trigger enforces the same invariant.
-          published: status === "approved",
-          moderated_by: actor.id,
-          moderated_at: new Date().toISOString(),
-        })
-        .eq("id", id);
-      if (error) {
-        notify({ type: "error", title: "Moderation failed", message: error.message });
-        return;
-      }
+    if (!supabase) {
+      state = { ...state, testimonials: previous };
+      emit();
+      notify({ type: "error", title: "Moderation failed", message: "Cloud database is not configured; the change was not saved." });
+      return false;
     }
+    // `.select()` is the verification step: an UPDATE whose row RLS filters
+    // out returns NO error and zero rows. Requiring the updated row back
+    // guarantees the database actually changed before the CMS claims success.
+    const { data, error } = await supabase
+      .from(TABLES.testimonials)
+      .update({
+        status,
+        flagged: status === "flagged",
+        // Keep the legacy `published` flag in lock-step with `status` so an
+        // approved testimonial is publicly visible regardless of which RLS
+        // policy/trigger version is installed. The canonical public policy
+        // reads status = 'approved' (which the frontend filters by); the
+        // baseline policy reads published = true. Setting both here covers
+        // both, and the DB trigger enforces the same invariant.
+        published: status === "approved",
+        moderated_by: actor.id,
+        moderated_at: new Date().toISOString(),
+      })
+      .eq("id", id)
+      .select("*");
+    if (error || !data || data.length === 0) {
+      state = { ...state, testimonials: previous };
+      emit();
+      const message = error
+        ? error.message
+        : "The database did not update any record. Your account may lack staff permissions (RLS) — the change was not saved.";
+      notify({ type: "error", title: "Moderation failed", message });
+      audit(`testimonial.${status}`, "testimonial", "failure", { actorId: actor.id, targetId: id, reason: message });
+      return false;
+    }
+    // Adopt the stored row (post-trigger values) so the CMS shows exactly
+    // what the database persisted.
+    const stored = testimonialFromRow(data[0] as DbTestimonialRow);
+    state = { ...state, testimonials: state.testimonials.map((t) => (t.id === id ? stored : t)) };
+    emit();
     audit(`testimonial.${status}`, "testimonial", "success", { actorId: actor.id, actorEmail: actor.email, targetId: id });
     void writeCloudAudit(actor.id, `testimonial.${status}`, "testimonial", { outcome: "success", targetId: id });
     logActivity(status === "approved" ? "published" : "updated", "Testimonial", id, target.guestName);
@@ -2138,57 +2186,102 @@ const actions = {
       title: status === "approved" ? "Testimonial published" : `Testimonial ${status}`,
       message: `${target.guestName}'s testimonial is now ${status}.`,
     });
+    return true;
   },
 
   /** Staff edit of the testimonial body or attribution. */
-  async updateTestimonial(id: string, patch: Partial<Testimonial>): Promise<void> {
+  async updateTestimonial(id: string, patch: Partial<Testimonial>): Promise<boolean> {
     const actor = currentUser();
     if (!actor || !can(actor, "blog", "edit")) {
       notify({ type: "error", title: "Not permitted" });
-      return;
+      return false;
     }
     const target = state.testimonials.find((t) => t.id === id);
-    if (!target) return;
+    if (!target) return false;
 
+    // Optimistic UI, rolled back unless the database confirms the write.
+    const previous = state.testimonials;
     state = { ...state, testimonials: state.testimonials.map((t) => (t.id === id ? { ...t, ...patch } : t)) };
     emit();
 
-    if (supabase) {
-      const row: Record<string, unknown> = {};
-      if (patch.quote !== undefined) row.quote = patch.quote;
-      if (patch.guestName !== undefined) row.guest_name = patch.guestName;
-      if (patch.guestLocation !== undefined) row.guest_location = patch.guestLocation || null;
-      if (patch.guestPhoto !== undefined) row.guest_photo = patch.guestPhoto || null;
-      if (patch.staffNotes !== undefined) row.staff_notes = patch.staffNotes || null;
-      if (patch.sortOrder !== undefined) row.sort_order = patch.sortOrder;
-      if (Object.keys(row).length > 0) {
-        const { error } = await supabase.from(TABLES.testimonials).update(row).eq("id", id);
-        if (error) { notify({ type: "error", title: "Save failed", message: error.message }); return; }
+    // Deliberately constructed payload: only real database columns are sent.
+    const row: Record<string, unknown> = {};
+    if (patch.quote !== undefined) row.quote = patch.quote;
+    if (patch.guestName !== undefined) row.guest_name = patch.guestName;
+    if (patch.guestLocation !== undefined) row.guest_location = patch.guestLocation || null;
+    if (patch.guestPhoto !== undefined) row.guest_photo = patch.guestPhoto || null;
+    if (patch.staffNotes !== undefined) row.staff_notes = patch.staffNotes || null;
+    if (patch.sortOrder !== undefined) row.sort_order = patch.sortOrder;
+
+    if (Object.keys(row).length > 0) {
+      if (!supabase) {
+        state = { ...state, testimonials: previous };
+        emit();
+        notify({ type: "error", title: "Save failed", message: "Cloud database is not configured; the edit was not saved." });
+        return false;
       }
+      // `.select()` verifies the write reached a row: RLS-filtered updates
+      // return no error and zero rows, which must never be reported as saved.
+      const { data, error } = await supabase
+        .from(TABLES.testimonials)
+        .update(row)
+        .eq("id", id)
+        .select("*");
+      if (error || !data || data.length === 0) {
+        state = { ...state, testimonials: previous };
+        emit();
+        const message = error
+          ? error.message
+          : "The database did not update any record. Your account may lack staff permissions (RLS) — the edit was not saved.";
+        notify({ type: "error", title: "Save failed", message });
+        audit("testimonial.updated", "testimonial", "failure", { actorId: actor.id, targetId: id, reason: message });
+        return false;
+      }
+      // Re-fetch semantics: display the record as the database stored it
+      // (triggers trim text and bump updated_at).
+      const stored = testimonialFromRow(data[0] as DbTestimonialRow);
+      state = { ...state, testimonials: state.testimonials.map((t) => (t.id === id ? stored : t)) };
+      emit();
     }
     audit("testimonial.updated", "testimonial", "success", { actorId: actor.id, targetId: id });
     notify({ type: "success", title: "Testimonial saved" });
+    return true;
   },
 
-  async deleteTestimonial(id: string): Promise<void> {
+  async deleteTestimonial(id: string): Promise<boolean> {
     const actor = currentUser();
     if (!actor || !can(actor, "blog", "delete")) {
       notify({ type: "error", title: "Not permitted", message: "You do not have permission to delete testimonials." });
-      return;
+      return false;
     }
     const target = state.testimonials.find((t) => t.id === id);
-    if (!target) return;
+    if (!target) return false;
 
+    const previous = state.testimonials;
     state = { ...state, testimonials: state.testimonials.filter((t) => t.id !== id) };
     emit();
 
-    if (supabase) {
-      const { error } = await supabase.from(TABLES.testimonials).delete().eq("id", id);
-      if (error) { notify({ type: "error", title: "Delete failed", message: error.message }); return; }
+    if (!supabase) {
+      state = { ...state, testimonials: previous };
+      emit();
+      notify({ type: "error", title: "Delete failed", message: "Cloud database is not configured; nothing was deleted." });
+      return false;
+    }
+    // Verified delete: zero returned rows means RLS blocked it silently.
+    const { data, error } = await supabase.from(TABLES.testimonials).delete().eq("id", id).select("id");
+    if (error || !data || data.length === 0) {
+      state = { ...state, testimonials: previous };
+      emit();
+      const message = error
+        ? error.message
+        : "The database did not delete any record. Your account may lack staff permissions (RLS).";
+      notify({ type: "error", title: "Delete failed", message });
+      return false;
     }
     audit("testimonial.deleted", "testimonial", "success", { actorId: actor.id, targetId: id });
     logActivity("deleted", "Testimonial", id, target.guestName);
     notify({ type: "info", title: "Testimonial deleted" });
+    return true;
   },
 
   // Guides

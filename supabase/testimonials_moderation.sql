@@ -131,6 +131,8 @@ drop policy if exists "Anyone can read approved testimonials" on public.testimon
 drop policy if exists "Anyone can submit a testimonial" on public.testimonials;
 drop policy if exists "Staff can read every testimonial" on public.testimonials;
 drop policy if exists "Staff can moderate testimonials" on public.testimonials;
+drop policy if exists "Staff can delete testimonials" on public.testimonials;
+drop policy if exists "Staff can create testimonials" on public.testimonials;
 
 -- Visitors read ONLY approved entries. No helper function is called here: if
 -- public.is_staff() were referenced and missing, the whole SELECT would fail

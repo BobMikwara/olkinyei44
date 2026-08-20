@@ -29,13 +29,15 @@ function TestimonialReview({ testimonial, onClose }: { testimonial: Testimonial;
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   const moderate = async (status: TestimonialStatus) => {
-    await store.actions.setTestimonialStatus(testimonial.id, status);
-    onClose();
+    // Keep the panel open when the database rejected the change so the
+    // moderator sees the error instead of a silently discarded action.
+    const ok = await store.actions.setTestimonialStatus(testimonial.id, status);
+    if (ok) onClose();
   };
 
   const saveEdits = async () => {
-    await store.actions.updateTestimonial(testimonial.id, draft);
-    onClose();
+    const ok = await store.actions.updateTestimonial(testimonial.id, draft);
+    if (ok) onClose();
   };
 
   const isExternal = testimonial.source !== "website";

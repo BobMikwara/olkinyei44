@@ -36,7 +36,12 @@ alter table public.profiles
   add constraint profiles_role_check
   check (role in ('root', 'super_admin', 'content_manager', 'booking_manager', 'marketing_manager', 'finance'));
 
--- 4. Rebuild every predicate against canonical names.
+-- 4. Rebuild every predicate against canonical names. Legacy spellings are
+--    still ACCEPTED (never granted) so a database in a partially migrated
+--    state cannot lock its own staff out — an is_staff() that returns false
+--    for a real staff member makes RLS filter their UPDATEs into silent
+--    zero-row no-ops (the root cause of "saved in the CMS but not in the
+--    database"). These bodies are identical to supabase/auth_schema_sync.sql.
 create or replace function public.is_root_admin()
 returns boolean
 language sql
@@ -46,7 +51,8 @@ set search_path = public
 as $$
   select exists(
     select 1 from public.profiles
-    where id = auth.uid() and status = 'active' and (is_root = true or role = 'root')
+    where id = auth.uid() and status = 'active'
+      and (is_root = true or role in ('root', 'root_super_admin'))
   );
 $$;
 
@@ -60,7 +66,7 @@ as $$
   select exists(
     select 1 from public.profiles
     where id = auth.uid() and status = 'active'
-      and (is_root = true or role in ('root', 'super_admin'))
+      and (is_root = true or role in ('root', 'root_super_admin', 'super_admin', 'admin'))
   );
 $$;
 
@@ -74,7 +80,10 @@ as $$
   select exists(
     select 1 from public.profiles
     where id = auth.uid() and status = 'active'
-      and (is_root = true or role in ('root', 'super_admin', 'booking_manager'))
+      and (is_root = true or role in (
+        'root', 'root_super_admin', 'super_admin', 'admin',
+        'booking_manager', 'reservation_manager', 'reservation', 'bookings'
+      ))
   );
 $$;
 
@@ -90,12 +99,19 @@ as $$
     where id = auth.uid() and status = 'active'
       and (
         is_root = true
-        or role in ('root', 'super_admin', 'content_manager', 'booking_manager', 'marketing_manager', 'finance')
+        or role in (
+          'root', 'root_super_admin', 'super_admin', 'admin',
+          'content_manager', 'editor',
+          'booking_manager', 'reservation_manager', 'reservation', 'bookings',
+          'marketing_manager', 'marketing',
+          'finance'
+        )
       )
   );
 $$;
 
--- 5. Root-protection triggers must test the canonical value.
+-- 5. Root-protection triggers must test the canonical value (and the legacy
+--    spelling, so a half-migrated root row stays protected).
 create or replace function public.protect_root_profile()
 returns trigger
 language plpgsql
@@ -103,14 +119,14 @@ security definer
 set search_path = public
 as $$
 begin
-  if old.is_root = true or old.role = 'root' then
+  if old.is_root = true or old.role in ('root', 'root_super_admin') then
     if public.is_root_service() then
       return new;
     end if;
     raise exception 'The Root Super Admin cannot be modified';
   end if;
 
-  if (new.role = 'root' or new.is_root = true) and not public.is_root_service() then
+  if (new.role in ('root', 'root_super_admin') or new.is_root = true) and not public.is_root_service() then
     raise exception 'The Root Super Admin cannot be created from the client';
   end if;
 
@@ -125,7 +141,7 @@ security definer
 set search_path = public
 as $$
 begin
-  if (old.is_root = true or old.role = 'root') and not public.is_root_service() then
+  if (old.is_root = true or old.role in ('root', 'root_super_admin')) and not public.is_root_service() then
     raise exception 'The Root Super Admin cannot be deleted';
   end if;
   return old;

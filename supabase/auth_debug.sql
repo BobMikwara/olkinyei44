@@ -6,9 +6,10 @@ select id, email, role, status, is_root, invited_by, created_at, last_login_at
 from public.profiles
 order by is_root desc, created_at;
 
--- Expected: exactly one is_root = true row with role = root_super_admin,
--- status = active. Any other role values here mean auth_schema_sync.sql
--- needs to be (re)run.
+-- Expected: exactly one is_root = true row with role = root, status = active.
+-- Any role outside root/super_admin/content_manager/booking_manager/
+-- marketing_manager/finance means role_canonicalization.sql needs to be
+-- (re)run.
 
 -- 2. For a specific user, show the auth user + profile side by side.
 -- Replace both placeholders with the failing account's email.
@@ -39,15 +40,15 @@ from pg_publication_tables
 where pubname = 'supabase_realtime'
 order by tablename;
 
--- 6. Role invariants — must return zero rows.
+-- 6. Role invariants — must return zero rows (canonical vocabulary).
 select email, role, status from public.profiles
-where role not in ('root_super_admin','super_admin','content_manager','editor','reservation_manager','marketing','finance')
+where role not in ('root','super_admin','content_manager','booking_manager','marketing_manager','finance')
    or status not in ('active','pending','suspended','deleted');
 
 -- 7. Root invariants — must return exactly ONE row.
 select count(*) as root_count
 from public.profiles
-where is_root = true or role = 'root_super_admin';
+where is_root = true or role in ('root', 'root_super_admin');
 
 -- 8. Recent auth audit events for a user.
 -- Replace email first, then:

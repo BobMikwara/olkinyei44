@@ -16,18 +16,20 @@ VITE_SUPABASE_URL=https://<project>.supabase.co
 VITE_SUPABASE_ANON_KEY=<anon-key>
 ```
 
-Run the migrations in this order: `supabase/schema.sql` → `supabase/production_auth.sql` (superseded pointer) → `supabase/auth_schema_sync.sql` → `supabase/bookings_hardening.sql`. The sync migration normalises legacy role values in place and is idempotent.
+Run the migrations in this order: `supabase/schema.sql` → `supabase/auth_schema_sync.sql` → `supabase/role_canonicalization.sql` → `supabase/packages_sync.sql` → `supabase/testimonials_moderation.sql` → `supabase/testimonials_sources.sql` → `supabase/blog_posts_sync.sql` → `supabase/bookings_hardening.sql` → `supabase/cms_content.sql` → `supabase/cms_content_persistence.sql` → `supabase/storage_persistence.sql`. Every file is idempotent; `production_auth.sql` is a superseded pointer and can be skipped. The sync migrations normalise legacy role values in place to the canonical vocabulary (`root · super_admin · content_manager · booking_manager · marketing_manager · finance`).
 
 ### 2. Apply the database schema
 
 Run in order inside the Supabase SQL editor:
 
 1. `supabase/schema.sql` — content tables + baseline RLS
-2. `supabase/production_auth.sql` — hardened profiles, audit logs, root triggers
-3. `supabase/packages_sync.sql` — Safari Packages (`public.packages`) canonical schema, RLS, and seed data (the single source of truth shared by the CMS and the public website)
-4. `supabase/cms_tokens.sql` — offline-mode setup tokens (optional fallback tables)
+2. `supabase/auth_schema_sync.sql` — hardened profiles, audit logs, root triggers
+3. `supabase/role_canonicalization.sql` — canonical role names + staff predicates (re-run this on an existing database if staff edits stop persisting: a stale `is_staff()` makes RLS silently reject updates)
+4. `supabase/packages_sync.sql` — Safari Packages (`public.packages`) canonical schema, RLS, and seed data (the single source of truth shared by the CMS and the public website)
+5. `supabase/testimonials_moderation.sql` and `supabase/testimonials_sources.sql` — testimonial moderation, ratings, review providers, RLS
+6. `supabase/blog_posts_sync.sql`, `supabase/bookings_hardening.sql`, `supabase/cms_content.sql`, `supabase/cms_content_persistence.sql`, `supabase/storage_persistence.sql`
 
-`production_auth.sql` grants no client insert/update/delete on `profiles`, adds `audit_logs`, and installs triggers that make the Root Super Admin immutable from the client.
+`auth_schema_sync.sql` grants no client insert/update/delete on `profiles`, adds `audit_logs`, and installs triggers that make the Root Super Admin immutable from the client.
 
 ### 3. Provision the first Root Super Admin ONCE
 

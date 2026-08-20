@@ -27,8 +27,23 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 const PRODUCTION_SITE_URL = process.env.PRODUCTION_SITE_URL ?? "https://premiumolkinyei.vercel.app";
 const SET_PASSWORD_PATH = process.env.SET_PASSWORD_PATH ?? "/auth/set-password";
 
-const ALLOWED_ROLES = new Set(["super_admin", "content_manager", "editor", "reservation_manager", "marketing", "finance"]);
-const ROOT_ROLES = new Set(["root_super_admin"]);
+// Canonical role vocabulary (mirrors src/admin/constants.ts and
+// supabase/role_canonicalization.sql). Legacy spellings from earlier schema
+// revisions are ACCEPTED as input and normalised to canonical before any
+// write, so the database converges on one vocabulary.
+const CANONICAL_ROLES = new Set(["super_admin", "content_manager", "booking_manager", "marketing_manager", "finance"]);
+const LEGACY_ROLE_ALIASES: Record<string, string> = {
+  admin: "super_admin",
+  editor: "content_manager",
+  reservation_manager: "booking_manager",
+  reservation: "booking_manager",
+  bookings: "booking_manager",
+  marketing: "marketing_manager",
+};
+function canonicalRole(role: string): string {
+  return LEGACY_ROLE_ALIASES[role] ?? role;
+}
+const ROOT_ROLES = new Set(["root", "root_super_admin"]);
 
 // ---------- Rate limiting: 12 invites / client IP / hour ---------------------
 // Verbose-Edge instances share memory, but only within the same region/life-time.
@@ -288,7 +303,7 @@ export default async function handler(request: Request): Promise<Response> {
   if (!callerIsRoot(caller)) {
     console.warn(`invite-user forbidden caller=${caller.id} role=${caller.profile?.role} status=${caller.profile?.status}`);
     return json(403, {
-      error: "Only the Root Super Admin can invite users. Expected: role = root_super_admin, status = active, is_root = true on your profile row.",
+      error: "Only the Root Super Admin can invite users. Expected: role = root (or legacy root_super_admin), status = active, is_root = true on your profile row.",
       stage: "forbidden",
       actual: JSON.stringify({ role: caller.profile?.role, status: caller.profile?.status, isRoot: caller.profile?.is_root }),
     });
@@ -301,11 +316,11 @@ export default async function handler(request: Request): Promise<Response> {
 
   const email = String(body.email ?? "").trim().toLowerCase();
   const fullName = String(body.fullName ?? "").trim().slice(0, 160);
-  const role = String(body.role ?? "").trim();
+  const role = canonicalRole(String(body.role ?? "").trim());
 
   if (!/^\S+@\S+\.\S+$/.test(email) || email.length > 254) return json(400, { error: "A valid email is required", stage: "payload" });
   if (!fullName) return json(400, { error: "Full name is required", stage: "payload" });
-  if (!ALLOWED_ROLES.has(role)) return json(400, { error: "Unsupported role", stage: "payload" });
+  if (!CANONICAL_ROLES.has(role)) return json(400, { error: "Unsupported role", stage: "payload" });
 
   // ---------- Supabase Admin: create + email the invitation ----------
   const redirectTo = `${PRODUCTION_SITE_URL}${SET_PASSWORD_PATH}`;
